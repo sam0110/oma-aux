@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Small JSON bridge between Oma Aux and the PipeWire command-line tools."""
+
+from __future__ import annotations
+
+import json
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def pipewire_dump() -> list[dict]:
+    try:
+        result = subprocess.run(
+            ["pw-dump"], capture_output=True, text=True, check=True, timeout=5
+        )
+        return json.loads(result.stdout)
+    except FileNotFoundError:
+        fail("pw-dump is required")
+    except (subprocess.SubprocessError, json.JSONDecodeError) as error:
+        fail(f"Could not read the PipeWire graph: {error}")
+
+
+def is_audio_port(props: dict, node_props: dict) -> bool:
+    media_class = str(node_props.get("media.class", "")).lower()
+    if "video" in media_class or "midi" in media_class:
+        return False
+    dsp_format = str(props.get("format.dsp", "")).lower()
+    return "audio" in dsp_format or bool(props.get("audio.channel"))
+
+
+def node_label(props: dict) -> str:
+    return str(
+        props.get("application.name")
+        or props.get("node.description")
+        or props.get("device.description")
+        or props.get("media.name")
+        or props.get("node.nick")
+        or props.get("node.name")
+        or "Unknown node"
+    )
+
+
+def endpoint_kind(media_class: str, direction: str) -> str:
+    if direction == "out":
+        if media_class == "Audio/Sink":
+            return "monitor"
+        if media_class == "Audio/Source":
+            return "source"
+        if media_class == "Stream/Output/Audio":
+            return "playback"
+        if media_class == "Stream/Input/Audio":
+            return "monitor"
+    else:
+        if media_class == "Audio/Sink":
+            return "device"
+        if media_class == "Stream/Input/Audio":
+            return "recording"
+        if media_class == "Stream/Output/Audio":
+            return "playback"
+    return "filter"
+
+
+KIND_ORDER = {
+    "playback": 0,
+    "source": 1,
+    "monitor": 2,
+    "recording": 0,
+    "device": 1,
+    "filter": 3,
+}
+
+
+def normalize_graph(objects: list[dict]) -> dict:
+    nodes: dict[int, dict] = {}
+    raw_ports: list[tuple[int, dict]] = []
+    raw_links: list[dict] = []
+
+    for obj in objects:
+        object_type = obj.get("type", "")
+        info = obj.get("info") or {}
+        if object_type == "PipeWire:Interface:Node":
+            nodes[int(obj["id"])] = info.get("props") or {}
+        elif object_type == "PipeWire:Interface:Port":
+            raw_ports.append((int(obj["id"]), info.get("props") or {}))
+        elif object_type == "PipeWire:Interface:Link":
+            raw_links.append(obj)
+
+    ports_by_node: dict[int, dict[str, list[dict]]] = defaultdict(
+        lambda: {"in": [], "out": []}
+    )
+    audio_port_ids: set[int] = set()
+    for port_id, props in raw_ports:
+        try:
+            node_id = int(props.get("node.id"))
+        except (TypeError, ValueError):
+            continue
+        node_props = nodes.get(node_id, {})
+        direction = str(props.get("port.direction", ""))
+        if direction not in ("in", "out") or not is_audio_port(props, node_props):
+            continue
+        port = {
+            "id": port_id,
+            "name": str(props.get("port.name") or props.get("port.alias") or port_id),
+            "alias": str(props.get("port.alias") or ""),
+            "channel": str(props.get("audio.channel") or ""),
+        }
+        ports_by_node[node_id][direction].append(port)
+        audio_port_ids.add(port_id)
+
+    sources: list[dict] = []
+    destinations: list[dict] = []
+    for node_id, directions in ports_by_node.items():
+        props = nodes.get(node_id, {})
+        media_class = str(props.get("media.class") or "")
+        base_label = node_label(props)
+        name = str(props.get("node.name") or node_id)
+        for direction, target in (("out", sources), ("in", destinations)):
+            ports = sorted(
+                directions[direction], key=lambda port: (port["channel"], port["name"])
+            )
+            if not ports:
+                continue
+            kind = endpoint_kind(media_class, direction)
+            label = f"{base_label} monitor" if kind == "monitor" else base_label
+            target.append(
+                {
+                    "id": node_id,
+                    "key": f"{name}:{direction}",
+                    "name": name,
+                    "label": label,
+                    "kind": kind,
+                    "mediaClass": media_class,
+                    "ports": ports,
+                }
+            )
+
+    sort_key = lambda endpoint: (
+        KIND_ORDER.get(endpoint["kind"], 99),
+        endpoint["label"].casefold(),
+        endpoint["id"],
+    )
+    sources.sort(key=sort_key)
+    destinations.sort(key=sort_key)
+
+    links = []
+    for obj in raw_links:
+        info = obj.get("info") or {}
+        try:
+            output_port = int(info["output-port-id"])
+            input_port = int(info["input-port-id"])
+            if output_port not in audio_port_ids or input_port not in audio_port_ids:
+                continue
+            links.append(
+                {
+                    "id": int(obj["id"]),
+                    "outputNode": int(info["output-node-id"]),
+                    "outputPort": output_port,
+                    "inputNode": int(info["input-node-id"]),
+                    "inputPort": input_port,
+                    "state": str(info.get("state") or ""),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return {"sources": sources, "destinations": destinations, "links": links}
+
+
+def graph_snapshot() -> dict:
+    return normalize_graph(pipewire_dump())
+
+
+def emit_snapshot() -> None:
+    print(json.dumps(graph_snapshot(), separators=(",", ":")), flush=True)
+
+
+def channel_pairs(outputs: list[dict], inputs: list[dict]) -> list[tuple[int, int]]:
+    """Pair ports by channel, with useful mono and positional fallbacks."""
+    by_output_channel: dict[str, list[dict]] = defaultdict(list)
+    by_input_channel: dict[str, list[dict]] = defaultdict(list)
+    for port in outputs:
+        if port["channel"]:
+            by_output_channel[port["channel"]].append(port)
+    for port in inputs:
+        if port["channel"]:
+            by_input_channel[port["channel"]].append(port)
+
+    pairs: list[tuple[int, int]] = []
+    used_outputs: set[int] = set()
+    used_inputs: set[int] = set()
+    for channel in sorted(set(by_output_channel) & set(by_input_channel)):
+        for output, input_ in zip(
+            by_output_channel[channel], by_input_channel[channel], strict=False
+        ):
+            pairs.append((output["id"], input_["id"]))
+            used_outputs.add(output["id"])
+            used_inputs.add(input_["id"])
+
+    remaining_outputs = [port for port in outputs if port["id"] not in used_outputs]
+    remaining_inputs = [port for port in inputs if port["id"] not in used_inputs]
+    if len(remaining_outputs) == 1:
+        pairs.extend((remaining_outputs[0]["id"], port["id"]) for port in remaining_inputs)
+    elif len(remaining_inputs) == 1:
+        pairs.extend((port["id"], remaining_inputs[0]["id"]) for port in remaining_outputs)
+    else:
+        pairs.extend(
+            (output["id"], input_["id"])
+            for output, input_ in zip(
+                remaining_outputs, remaining_inputs, strict=False
+            )
+        )
+    return pairs
+
+
+def endpoint(graph: dict, collection: str, node_id: int) -> dict:
+    for candidate in graph[collection]:
+        if candidate["id"] == node_id:
+            return candidate
+    fail(f"PipeWire node {node_id} disappeared")
+
+
+def run_pw_link(*arguments: str) -> None:
+    try:
+        result = subprocess.run(
+            ["pw-link", *arguments], capture_output=True, text=True, timeout=5
+        )
+    except FileNotFoundError:
+        fail("pw-link is required")
+    except subprocess.SubprocessError as error:
+        fail(f"pw-link failed: {error}")
+    if result.returncode != 0:
+        fail(result.stderr.strip() or "pw-link failed")
+
+
+def connect_nodes(output_node: int, input_node: int) -> None:
+    graph = graph_snapshot()
+    source = endpoint(graph, "sources", output_node)
+    destination = endpoint(graph, "destinations", input_node)
+    existing = {
+        (link["outputPort"], link["inputPort"])
+        for link in graph["links"]
+        if link["outputNode"] == output_node and link["inputNode"] == input_node
+    }
+    for output_port, input_port in channel_pairs(source["ports"], destination["ports"]):
+        if (output_port, input_port) not in existing:
+            run_pw_link("-L", str(output_port), str(input_port))
+
+
+def disconnect_nodes(output_node: int, input_node: int) -> None:
+    graph = graph_snapshot()
+    link_ids = [
+        link["id"]
+        for link in graph["links"]
+        if link["outputNode"] == output_node and link["inputNode"] == input_node
+    ]
+    for link_id in link_ids:
+        run_pw_link("-d", str(link_id))
+
+
+def toggle_nodes(output_node: int, input_node: int) -> None:
+    graph = graph_snapshot()
+    source = endpoint(graph, "sources", output_node)
+    destination = endpoint(graph, "destinations", input_node)
+    intended = set(channel_pairs(source["ports"], destination["ports"]))
+    matching_links = [
+        link
+        for link in graph["links"]
+        if link["outputNode"] == output_node and link["inputNode"] == input_node
+    ]
+    existing = {(link["outputPort"], link["inputPort"]) for link in matching_links}
+
+    if intended and intended <= existing:
+        for link in matching_links:
+            run_pw_link("-d", str(link["id"]))
+        return
+    for output_port, input_port in sorted(intended - existing):
+        run_pw_link("-L", str(output_port), str(input_port))
+
+
+def watch_graph() -> None:
+    try:
+        monitor = subprocess.Popen(
+            ["pw-link", "-iolm"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            bufsize=0,
+        )
+    except FileNotFoundError:
+        fail("pw-link is required")
+
+    stopping = False
+
+    def stop(_signum=None, _frame=None):
+        nonlocal stopping
+        stopping = True
+        if monitor.poll() is None:
+            monitor.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    selector = selectors.DefaultSelector()
+    selector.register(monitor.stdout, selectors.EVENT_READ)
+    refresh_due = 0.0
+
+    try:
+        # Subscribe first so a graph change cannot fall between the initial
+        # snapshot and monitor startup.
+        emit_snapshot()
+        while monitor.poll() is None:
+            events = selector.select(timeout=0.25)
+            if events:
+                chunk = os.read(monitor.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                if not refresh_due:
+                    refresh_due = time.monotonic() + 0.12
+            if refresh_due and time.monotonic() >= refresh_due:
+                emit_snapshot()
+                refresh_due = 0.0
+    finally:
+        selector.close()
+        if monitor.poll() is None:
+            monitor.terminate()
+        try:
+            monitor.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            monitor.kill()
+            monitor.wait(timeout=1)
+
+    if not stopping:
+        message = monitor.stderr.read().decode(errors="replace").strip()
+        fail(message or "PipeWire graph monitor stopped unexpectedly")
+
+
+def parse_node_id(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        fail(f"Invalid node id: {value}")
+
+
+def main(arguments: list[str]) -> None:
+    command = arguments[0] if arguments else "snapshot"
+    if command == "snapshot" and len(arguments) == 1:
+        emit_snapshot()
+        return
+    if command == "watch" and len(arguments) == 1:
+        watch_graph()
+        return
+    if command in ("connect", "disconnect", "toggle") and len(arguments) == 3:
+        output_node = parse_node_id(arguments[1])
+        input_node = parse_node_id(arguments[2])
+        if command == "connect":
+            connect_nodes(output_node, input_node)
+        elif command == "disconnect":
+            disconnect_nodes(output_node, input_node)
+        else:
+            toggle_nodes(output_node, input_node)
+        emit_snapshot()
+        return
+    fail("Usage: oma-aux [snapshot|watch|toggle OUT_NODE IN_NODE|connect OUT_NODE IN_NODE|disconnect OUT_NODE IN_NODE]")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

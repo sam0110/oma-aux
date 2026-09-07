@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "sam0110.oma-aux",
+  "name": "Oma Aux",
+  "version": "0.1.0",
+  "author": "sam0110",
+  "license": "MIT",
+  "description": "A PipeWire patchbay for connecting applications, devices, monitors, and filters from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Oma Aux",
+    "description": "Route PipeWire audio between applications, devices, monitors, and filters.",
+    "category": "Audio",
+    "aliases": ["pipewire", "patchbay", "routing", "aux"],
+    "allowMultiple": false
+  }
+}
