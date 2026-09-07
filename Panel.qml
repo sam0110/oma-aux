@@ -59,7 +59,7 @@ Panel {
     if (!source || !destination) return null
     for (var i = 0; i < routes.length; i++) {
       var route = routes[i]
-      if (route.sourceId === source.id && route.destinationId === destination.id)
+      if (route.sourceKey === source.key && route.destinationKey === destination.key)
         return route
     }
     return null
@@ -102,7 +102,7 @@ Panel {
       graph = parsed
       loading = false
       error = ""
-      if (!selectedSource)
+      if (selectedSourceKey === "")
         selectedSourceKey = sources.length ? sources[0].key : ""
       if (selectedRouteId !== "" && !selectedRoute)
         selectedRouteId = ""
@@ -112,15 +112,15 @@ Panel {
     }
   }
 
-  function toggleConnectionFor(sourceId, destinationId) {
-    if (sourceId < 0 || actionProc.running) return
-    pendingConnection = sourceId + ":" + destinationId
+  function toggleConnectionFor(sourceKey, destinationKey) {
+    if (!sourceKey || actionProc.running) return
+    pendingConnection = sourceKey + ":" + destinationKey
     error = ""
     actionProc.command = [
       pluginDir + "/bin/oma-aux",
       "toggle",
-      String(sourceId),
-      String(destinationId)
+      String(sourceKey),
+      String(destinationKey)
     ]
     actionProc.running = true
   }
@@ -148,8 +148,8 @@ Panel {
     actionProc.command = [
       pluginDir + "/bin/oma-aux",
       "filter-set",
-      String(selectedRoute.sourceId),
-      String(selectedRoute.destinationId),
+      String(selectedRoute.sourceKey),
+      String(selectedRoute.destinationKey),
       JSON.stringify({ "pan": editorPan, "eq": editorEq })
     ]
     actionProc.running = true
@@ -161,8 +161,8 @@ Panel {
     actionProc.command = [
       pluginDir + "/bin/oma-aux",
       "filter-clear",
-      String(selectedRoute.sourceId),
-      String(selectedRoute.destinationId)
+      String(selectedRoute.sourceKey),
+      String(selectedRoute.destinationKey)
     ]
     actionProc.running = true
   }
@@ -173,8 +173,8 @@ Panel {
     editorEq = gains
   }
 
-  function toggleConnection(destinationId) {
-    toggleConnectionFor(selectedSourceId, destinationId)
+  function toggleConnection(destinationKey) {
+    toggleConnectionFor(selectedSourceKey, destinationKey)
   }
 
   function beginConnection(sourceKey, point) {
@@ -196,7 +196,7 @@ Panel {
     var destination = graphBoard.destinationAt(point.x, point.y)
     drawingSourceKey = ""
     if (source && destination)
-      toggleConnectionFor(source.id, destination.id)
+      toggleConnectionFor(source.key, destination.key)
   }
 
   onOpenedChanged: {
@@ -629,7 +629,7 @@ Panel {
                 readonly property bool connected: routeState === "connected"
                 readonly property bool partial: routeState === "partial"
                 readonly property bool pending: root.pendingConnection
-                  === root.selectedSourceId + ":" + modelData.id
+                  === root.selectedSourceKey + ":" + modelData.key
                 x: graphBoard.width - width
                 y: index * graphBoard.rowPitch
                 width: graphBoard.nodeWidth
@@ -643,7 +643,7 @@ Panel {
                 MouseArea {
                   anchors.fill: parent
                   enabled: root.selectedSourceId >= 0 && !actionProc.running
-                  onClicked: root.toggleConnection(modelData.id)
+                  onClicked: root.toggleConnection(modelData.key)
                 }
 
                 Rectangle {

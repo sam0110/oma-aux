@@ -31,6 +31,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 STATE_PATH = STATE_DIR / "routes.json"
 LOCK_PATH = STATE_DIR / "routes.lock"
 MANAGED_PREFIX = "oma_aux_route_"
+PROCESS_TOKEN = str(time.time_ns())
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -70,10 +71,16 @@ def node_label(props: dict) -> str:
     )
 
 
-def endpoint_key(node_id: int, props: dict, direction: str) -> str:
+def endpoint_key(
+    node_id: int, props: dict, direction: str, session: str = PROCESS_TOKEN
+) -> str:
     media_class = str(props.get("media.class") or "")
+    if media_class == "Stream/Output/Audio" and direction == "out":
+        for property_name in ("application.id", "application.process.binary", "application.name"):
+            if props.get(property_name):
+                return f"app:{property_name}:{props[property_name]}:out"
     if media_class.startswith("Stream/"):
-        identity = node_id
+        identity = f"stream:{session}:{props.get('object.serial') or time.time_ns()}:{node_id}"
     else:
         identity = props.get("node.name") or props.get("object.serial") or node_id
     return f"{identity}:{direction}"
@@ -113,6 +120,19 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
     nodes: dict[int, dict] = {}
     raw_ports: list[tuple[int, dict]] = []
     raw_links: list[dict] = []
+    session = next(((obj.get("info") or {}).get("cookie") for obj in objects
+                    if obj.get("type") == "PipeWire:Interface:Core"), None)
+    if session is None:
+        # Scope anonymous serials to this server, not a reusable numeric ID.
+        # Recheck the socket on every dump in case the server was restarted.
+        try:
+            runtime = Path(os.environ.get("PIPEWIRE_RUNTIME_DIR")
+                           or os.environ.get("XDG_RUNTIME_DIR")
+                           or f"/run/user/{os.getuid()}")
+            socket = (runtime / os.environ.get("PIPEWIRE_REMOTE", "pipewire-0")).stat()
+            session = f"{socket.st_dev}-{socket.st_ino}-{socket.st_ctime_ns}"
+        except OSError:
+            session = str(time.time_ns())
 
     for obj in objects:
         object_type = obj.get("type", "")
@@ -133,7 +153,9 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
             node_id = int(props.get("node.id"))
         except (TypeError, ValueError):
             continue
-        node_props = nodes.get(node_id, {})
+        if node_id not in nodes:
+            continue
+        node_props = nodes[node_id]
         direction = str(props.get("port.direction", ""))
         if direction not in ("in", "out") or not is_audio_port(props, node_props):
             continue
@@ -171,7 +193,7 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
             target.append(
                 {
                     "id": node_id,
-                    "key": endpoint_key(node_id, props, direction),
+                    "key": endpoint_key(node_id, props, direction, str(session)),
                     "serial": str(props.get("object.serial") or ""),
                     "name": name,
                     "label": label,
@@ -180,6 +202,18 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
                     "ports": ports,
                 }
             )
+
+    grouped = {}
+    for source in sources:
+        if source["key"].startswith("app:"):
+            if source["key"] not in grouped:
+                grouped[source["key"]] = {**source, "members": [], "ports": []}
+            group = grouped[source["key"]]
+            group["members"].append(source)
+            group["ports"].extend(source["ports"])
+        else:
+            grouped[source["key"]] = source
+    sources = list(grouped.values())
 
     sort_key = lambda endpoint: (
         KIND_ORDER.get(endpoint["kind"], 99),
@@ -297,34 +331,30 @@ def endpoint_by_name(graph: dict, collection: str, name: str) -> dict | None:
 def saved_endpoint(graph: dict, collection: str, route: dict, prefix: str) -> dict | None:
     key = route.get(f"{prefix}Key")
     name = route.get(f"{prefix}Name")
+    # Old numeric keys could mean either node IDs or serials. Neither proves
+    # application identity, even if a current node happens to have the same name.
+    if key and str(key).rsplit(":", 1)[0].isdigit():
+        route["status"] = "unresolved"
+        return None
     if key:
         matches = [
             item
             for item in graph.get(collection, [])
-            if item["key"] == key and item["name"] == name
+            if item["key"] == key
+            and (key.startswith(("app:", "stream:")) or item["name"] == name)
         ]
         if matches:
             return matches[0]
 
-        # Version 1 briefly stored PipeWire object serials for streams. Firefox
-        # replaces those serials when paused media resumes, while retaining the
-        # node id used by the graph.
-        direction = "out" if collection == "sources" else "in"
-        matches = [
-            item
-            for item in graph.get(collection, [])
-            if item.get("serial")
-            and f"{item['serial']}:{direction}" == key
-            and item["name"] == name
-        ]
-        if matches:
-            route[f"{prefix}Key"] = matches[0]["key"]
-            return matches[0]
         return None
-    matches = [item for item in graph.get(collection, []) if item["name"] == name]
+    matches = [item for item in graph.get(collection, []) if item["name"] == name
+               and not item.get("mediaClass", "").startswith("Stream/")]
     if len(matches) == 1:
         route[f"{prefix}Key"] = matches[0]["key"]
         return matches[0]
+    if not key and any(item["name"] == name and item.get("mediaClass", "").startswith("Stream/")
+                       for item in graph.get(collection, [])):
+        route["status"] = "unresolved"
     return None
 
 
@@ -520,16 +550,16 @@ def connect_endpoint_pair(graph: dict, source: dict, destination: dict) -> None:
     existing = {
         (link["outputPort"], link["inputPort"])
         for link in graph["links"]
-        if link["outputNode"] == source["id"] and link["inputNode"] == destination["id"]
     }
-    for output_port, input_port in channel_pairs(source["ports"], destination["ports"]):
+    for output_port, input_port in endpoint_pairs(source, destination):
         if (output_port, input_port) not in existing:
             run_pw_link("-L", str(output_port), str(input_port))
 
 
-def disconnect_endpoint_pair(graph: dict, source_id: int, destination_id: int) -> None:
+def disconnect_endpoint_pair(graph: dict, source: dict, destination: dict) -> None:
+    source_ids = {member["id"] for member in source.get("members", [source])}
     for link in graph["links"]:
-        if link["outputNode"] == source_id and link["inputNode"] == destination_id:
+        if link["outputNode"] in source_ids and link["inputNode"] == destination["id"]:
             run_pw_link("-d", str(link["id"]))
 
 
@@ -538,16 +568,35 @@ def activate_route(route: dict) -> None:
     source = saved_endpoint(public_graph, "sources", route, "source")
     destination = saved_endpoint(public_graph, "destinations", route, "destination")
     if not source or not destination:
-        route["status"] = "waiting"
+        if route.get("status") != "unresolved":
+            route["status"] = "waiting"
         return
     if not route_process_alive(route):
         spawn_route_process(route)
     graph, capture, playback = wait_for_processor(route)
+    source = saved_endpoint(graph, "sources", route, "source")
+    destination = saved_endpoint(graph, "destinations", route, "destination")
+    if not source or not destination:
+        route["status"] = "waiting"
+        return
     connect_endpoint_pair(graph, source, capture)
     graph = normalize_graph(pipewire_dump(), include_managed=True)
     connect_endpoint_pair(graph, playback, destination)
     graph = normalize_graph(pipewire_dump(), include_managed=True)
-    disconnect_endpoint_pair(graph, source["id"], destination["id"])
+    source = saved_endpoint(graph, "sources", route, "source")
+    destination = saved_endpoint(graph, "destinations", route, "destination")
+    capture = endpoint_by_name(graph, "destinations", route["captureName"])
+    playback = endpoint_by_name(graph, "sources", route["playbackName"])
+    if not all((source, destination, capture, playback)):
+        route["status"] = "waiting"
+        return
+    # Do not remove direct links until every current member has a filtered path.
+    intended = set(endpoint_pairs(source, capture) + endpoint_pairs(playback, destination))
+    existing = {(link["outputPort"], link["inputPort"]) for link in graph["links"]}
+    if not intended or not intended <= existing:
+        route["status"] = "waiting"
+        return
+    disconnect_endpoint_pair(graph, source, destination)
     route["status"] = "connected"
 
 
@@ -557,7 +606,12 @@ def reconcile_routes() -> dict:
         changed = False
         for route in state["routes"]:
             old = dict(route)
-            activate_route(route)
+            try:
+                activate_route(route)
+            except SystemExit:
+                # Graph objects can vanish between dump and link operations.
+                # Keep the saved intent and retry without killing the watcher.
+                route["status"] = "waiting"
             changed = changed or route != old
         if changed:
             save_state(state)
@@ -565,9 +619,13 @@ def reconcile_routes() -> dict:
 
 
 def direct_routes(graph: dict) -> list[dict]:
+    sources_by_node = {member["id"]: source for source in graph["sources"]
+                       for member in source.get("members", [source])}
     grouped: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for link in graph["links"]:
-        grouped[(link["outputNode"], link["inputNode"])].append(link)
+        source = sources_by_node.get(link["outputNode"])
+        if source:
+            grouped[(source["id"], link["inputNode"])].append(link)
     routes = []
     for (source_id, destination_id), links in grouped.items():
         source = next((item for item in graph["sources"] if item["id"] == source_id), None)
@@ -576,7 +634,7 @@ def direct_routes(graph: dict) -> list[dict]:
         )
         if not source or not destination:
             continue
-        intended = set(channel_pairs(source["ports"], destination["ports"]))
+        intended = set(endpoint_pairs(source, destination))
         existing = {(link["outputPort"], link["inputPort"]) for link in links}
         routes.append(
             {
@@ -659,9 +717,16 @@ def channel_pairs(outputs: list[dict], inputs: list[dict]) -> list[tuple[int, in
     return pairs
 
 
-def endpoint(graph: dict, collection: str, node_id: int) -> dict:
+def endpoint_pairs(source: dict, destination: dict) -> list[tuple[int, int]]:
+    return [pair for member in source.get("members", [source])
+            for pair in channel_pairs(member["ports"], destination["ports"])]
+
+
+def endpoint(graph: dict, collection: str, node_id: int | str) -> dict:
     for candidate in graph[collection]:
-        if candidate["id"] == node_id:
+        if candidate.get("key") == node_id or any(
+            str(member["id"]) == str(node_id) for member in candidate.get("members", [candidate])
+        ):
             return candidate
     fail(f"PipeWire node {node_id} disappeared")
 
@@ -679,26 +744,21 @@ def run_pw_link(*arguments: str) -> None:
         fail(result.stderr.strip() or "pw-link failed")
 
 
-def connect_nodes(output_node: int, input_node: int) -> None:
+def connect_nodes(output_node: int | str, input_node: int | str) -> None:
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
-    existing = {
-        (link["outputPort"], link["inputPort"])
-        for link in graph["links"]
-        if link["outputNode"] == output_node and link["inputNode"] == input_node
-    }
-    for output_port, input_port in channel_pairs(source["ports"], destination["ports"]):
-        if (output_port, input_port) not in existing:
-            run_pw_link("-L", str(output_port), str(input_port))
+    with state_lock():
+        state = load_state()
+        saved = saved_route_for_endpoints(state, graph, source, destination)
+        if saved:
+            activate_route(saved)
+            save_state(state)
+            return
+    connect_endpoint_pair(graph, source, destination)
 
 
-def disconnect_nodes(output_node: int, input_node: int) -> None:
-    graph = normalize_graph(pipewire_dump())
-    disconnect_endpoint_pair(graph, output_node, input_node)
-
-
-def toggle_nodes(output_node: int, input_node: int) -> None:
+def disconnect_nodes(output_node: int | str, input_node: int | str) -> None:
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
@@ -709,12 +769,28 @@ def toggle_nodes(output_node: int, input_node: int) -> None:
             stop_route_process(saved)
             state["routes"].remove(saved)
             save_state(state)
+    disconnect_endpoint_pair(graph, source, destination)
+
+
+def toggle_nodes(output_node: int | str, input_node: int | str) -> None:
+    graph = normalize_graph(pipewire_dump())
+    source = endpoint(graph, "sources", output_node)
+    destination = endpoint(graph, "destinations", input_node)
+    with state_lock():
+        state = load_state()
+        saved = saved_route_for_endpoints(state, graph, source, destination)
+        if saved:
+            stop_route_process(saved)
+            state["routes"].remove(saved)
+            save_state(state)
+            disconnect_endpoint_pair(graph, source, destination)
             return
-    intended = set(channel_pairs(source["ports"], destination["ports"]))
+    intended = set(endpoint_pairs(source, destination))
+    source_ids = {member["id"] for member in source.get("members", [source])}
     matching_links = [
         link
         for link in graph["links"]
-        if link["outputNode"] == output_node and link["inputNode"] == input_node
+        if link["outputNode"] in source_ids and link["inputNode"] == destination["id"]
     ]
     existing = {(link["outputPort"], link["inputPort"]) for link in matching_links}
 
@@ -726,7 +802,7 @@ def toggle_nodes(output_node: int, input_node: int) -> None:
         run_pw_link("-L", str(output_port), str(input_port))
 
 
-def set_route_filter(output_node: int, input_node: int, value: object) -> None:
+def set_route_filter(output_node: int | str, input_node: int | str, value: object) -> None:
     settings = validate_filter(value)
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
@@ -764,7 +840,7 @@ def set_route_filter(output_node: int, input_node: int, value: object) -> None:
         save_state(state)
 
 
-def clear_route_filter(output_node: int, input_node: int) -> None:
+def clear_route_filter(output_node: int | str, input_node: int | str) -> None:
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
@@ -807,6 +883,7 @@ def watch_graph() -> None:
     selector = selectors.DefaultSelector()
     selector.register(monitor.stdout, selectors.EVENT_READ)
     refresh_due = 0.0
+    retry_due = time.monotonic() + 2
 
     try:
         # Subscribe first so a graph change cannot fall between the initial
@@ -820,9 +897,10 @@ def watch_graph() -> None:
                     break
                 if not refresh_due:
                     refresh_due = time.monotonic() + 0.12
-            if refresh_due and time.monotonic() >= refresh_due:
+            if (refresh_due and time.monotonic() >= refresh_due) or time.monotonic() >= retry_due:
                 emit_snapshot()
                 refresh_due = 0.0
+                retry_due = time.monotonic() + 2
     finally:
         selector.close()
         if monitor.poll() is None:
@@ -838,13 +916,6 @@ def watch_graph() -> None:
         fail(message or "PipeWire graph monitor stopped unexpectedly")
 
 
-def parse_node_id(value: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        fail(f"Invalid node id: {value}")
-
-
 def main(arguments: list[str]) -> None:
     command = arguments[0] if arguments else "snapshot"
     if command == "snapshot" and len(arguments) == 1:
@@ -854,8 +925,8 @@ def main(arguments: list[str]) -> None:
         watch_graph()
         return
     if command in ("connect", "disconnect", "toggle") and len(arguments) == 3:
-        output_node = parse_node_id(arguments[1])
-        input_node = parse_node_id(arguments[2])
+        output_node = arguments[1]
+        input_node = arguments[2]
         if command == "connect":
             connect_nodes(output_node, input_node)
         elif command == "disconnect":
@@ -869,11 +940,11 @@ def main(arguments: list[str]) -> None:
             settings = json.loads(arguments[3])
         except json.JSONDecodeError:
             fail("Filter settings must be valid JSON")
-        set_route_filter(parse_node_id(arguments[1]), parse_node_id(arguments[2]), settings)
+        set_route_filter(arguments[1], arguments[2], settings)
         emit_snapshot()
         return
     if command == "filter-clear" and len(arguments) == 3:
-        clear_route_filter(parse_node_id(arguments[1]), parse_node_id(arguments[2]))
+        clear_route_filter(arguments[1], arguments[2])
         emit_snapshot()
         return
     fail(
