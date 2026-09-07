@@ -18,6 +18,7 @@
     "description": "Route PipeWire audio between applications, devices, monitors, and filters.",
     "category": "Audio",
     "aliases": ["pipewire", "patchbay", "routing", "aux"],
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

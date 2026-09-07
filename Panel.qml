@@ -602,6 +602,7 @@ Panel {
                     anchors.margins: -Style.space(10)
                     cursorShape: Qt.CrossCursor
                     enabled: !actionProc.running
+                    preventStealing: true
                     onPressed: function(mouse) {
                       var point = mapToItem(graphBoard, mouse.x, mouse.y)
                       root.beginConnection(modelData.key, point)
