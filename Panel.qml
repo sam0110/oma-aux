@@ -21,6 +21,9 @@ Panel {
   property bool loading: false
   property string error: ""
   property var meterLevels: ({})
+  property var pendingAppSettings: ({})
+  property bool appDragging: false
+  property string deferredSnapshot: ""
   property string pendingConnection: ""
   property string drawingSourceKey: ""
   property real drawingX: 0
@@ -97,6 +100,11 @@ Panel {
   }
 
   function applySnapshot(line) {
+    // Replacing a Repeater model during a drag destroys its active slider.
+    if (appDragging) {
+      deferredSnapshot = String(line)
+      return
+    }
     try {
       var parsed = JSON.parse(String(line || ""))
       if (!parsed.sources || !parsed.destinations || !parsed.links || !parsed.routes) return
@@ -110,6 +118,47 @@ Panel {
     } catch (e) {
       error = "Could not understand the PipeWire graph"
       loading = false
+    }
+  }
+
+  function queueAppSettings(key, settings) {
+    var pending = Object.assign({}, pendingAppSettings)
+    pending[key] = Object.assign({}, pending[key] || {}, settings)
+    pendingAppSettings = pending
+    if (!appUpdateTimer.running) appUpdateTimer.start()
+  }
+
+  function flushAppSettings() {
+    var keys = Object.keys(pendingAppSettings)
+    if (!keys.length) return
+    if (appProc.running) {
+      appUpdateTimer.start()
+      return
+    }
+    var key = keys[0]
+    appProc.command = [pluginDir + "/bin/oma-aux", "app-set", key, JSON.stringify(pendingAppSettings[key])]
+    var pending = Object.assign({}, pendingAppSettings)
+    delete pending[key]
+    pendingAppSettings = pending
+    appProc.running = true
+  }
+
+  Timer {
+    id: appUpdateTimer
+    interval: 120
+    onTriggered: root.flushAppSettings()
+  }
+
+  Process {
+    id: appProc
+    stdout: SplitParser { onRead: function(line) { root.applySnapshot(line) } }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (String(text || "").trim()) root.error = String(text).trim()
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.error = "Could not update all application streams"
+      if (Object.keys(root.pendingAppSettings).length) appUpdateTimer.start()
     }
   }
 
@@ -205,6 +254,12 @@ Panel {
       loading = sources.length === 0
       error = ""
     } else {
+      appDragging = false
+      if (deferredSnapshot !== "") {
+        var snapshot = deferredSnapshot
+        deferredSnapshot = ""
+        Qt.callLater(function() { root.applySnapshot(snapshot) })
+      }
       meterLevels = ({})
       pendingConnection = ""
       drawingSourceKey = ""
@@ -267,7 +322,7 @@ Panel {
   Process {
     id: graphWatcher
     command: [root.pluginDir + "/bin/oma-aux", "watch"]
-    // Reconcile audio routes even while the panel is closed.
+    // Restore routes and new application streams even while the panel is closed.
     running: true
     stdout: SplitParser { onRead: function(line) { root.applySnapshot(line) } }
     stderr: StdioCollector {
@@ -437,8 +492,8 @@ Panel {
             height: implicitHeight
 
             readonly property real nodeWidth: Math.min(Style.space(250), width * 0.32)
-            readonly property real nodeHeight: Style.space(64)
-            readonly property real rowPitch: Style.space(76)
+            readonly property real nodeHeight: Style.space(88)
+            readonly property real rowPitch: Style.space(100)
             readonly property real socketRadius: Style.space(6)
 
             function destinationAt(x, y) {
@@ -636,6 +691,72 @@ Panel {
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
+                  }
+
+                  Row {
+                    visible: !!modelData.appControl
+                    width: parent.width
+                    height: visible ? Style.space(24) : 0
+                    spacing: Style.space(4)
+
+                    Slider {
+                      id: appVolume
+                      width: Math.max(0, parent.width - appVolumeLabel.width - appMute.width - parent.spacing * 2)
+                      height: parent.height
+                      from: 0
+                      to: 100
+                      stepSize: 1
+                      value: modelData.appControl ? Math.min(100, modelData.appControl.volume) : 100
+                      onMoved: root.queueAppSettings(modelData.key, { "volume": Math.round(value) })
+                      onPressedChanged: {
+                        root.appDragging = pressed
+                        if (!pressed && root.deferredSnapshot !== "") {
+                          var snapshot = root.deferredSnapshot
+                          root.deferredSnapshot = ""
+                          Qt.callLater(function() { root.applySnapshot(snapshot) })
+                        }
+                      }
+                      ToolTip.visible: hovered
+                      ToolTip.text: "Application volume (all streams)"
+                    }
+
+                    Text {
+                      id: appVolumeLabel
+                      width: Style.space(40)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: Math.round(appVolume.pressed ? appVolume.value : (modelData.appControl || {}).volume || 0)
+                        + "%" + ((modelData.appControl || {}).volumeMixed ? "*" : "")
+                      color: root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      horizontalAlignment: Text.AlignRight
+                    }
+
+                    Rectangle {
+                      id: appMute
+                      width: Style.space(42)
+                      height: parent.height
+                      radius: Style.cornerRadius
+                      color: (modelData.appControl || {}).mute
+                        ? Style.selectedFillFor(root.bar.foreground, Color.accent)
+                        : Style.hoverFillFor(root.bar.foreground, Color.accent)
+                      opacity: muteArea.enabled ? 1 : 0.5
+                      Text {
+                        anchors.centerIn: parent
+                        text: (modelData.appControl || {}).mute ? "MUTED"
+                          : ((modelData.appControl || {}).muteMixed ? "MIXED" : "MUTE")
+                        color: (modelData.appControl || {}).mute ? Color.accent : root.bar.foreground
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption * 0.85
+                      }
+                      MouseArea {
+                        id: muteArea
+                        anchors.fill: parent
+                        enabled: !appProc.running && !root.pendingAppSettings[modelData.key]
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.queueAppSettings(modelData.key, { "mute": !modelData.appControl.mute })
+                      }
+                    }
                   }
                 }
 

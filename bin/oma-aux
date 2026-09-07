@@ -122,6 +122,7 @@ KIND_ORDER = {
 
 def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
     nodes: dict[int, dict] = {}
+    controls: dict[int, dict] = {}
     raw_ports: list[tuple[int, dict]] = []
     raw_links: list[dict] = []
     session = next(((obj.get("info") or {}).get("cookie") for obj in objects
@@ -143,6 +144,9 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
         info = obj.get("info") or {}
         if object_type == "PipeWire:Interface:Node":
             nodes[int(obj["id"])] = info.get("props") or {}
+            values = (info.get("params") or {}).get("Props") or []
+            control = next((v for v in values if "channelVolumes" in v), {})
+            controls[int(obj["id"])] = {k: control[k] for k in ("channelVolumes", "mute") if k in control}
         elif object_type == "PipeWire:Interface:Port":
             raw_ports.append((int(obj["id"]), info.get("props") or {}))
         elif object_type == "PipeWire:Interface:Link":
@@ -203,6 +207,8 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
                     "id": node_id,
                     "key": endpoint_key(node_id, props, direction, str(session)),
                     "serial": str(props.get("object.serial") or ""),
+                    "lifetime": f"{session}:{props.get('object.serial', '')}:{node_id}",
+                    "controls": controls.get(node_id, {}),
                     "name": name,
                     "label": label,
                     "kind": kind,
@@ -222,6 +228,26 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
         else:
             grouped[source["key"]] = source
     sources = list(grouped.values())
+    for source in sources:
+        if not source["key"].startswith("app:"):
+            continue
+        members = source["members"]
+        available = all(member["serial"].isdigit() and member["controls"].get("channelVolumes")
+                        and type(member["controls"].get("mute")) is bool for member in members)
+        if not available:
+            source["appControl"] = None
+            continue
+        volumes = [float(v) for member in members for v in member["controls"]["channelVolumes"]]
+        if any(not math.isfinite(v) or v < 0 for v in volumes):
+            source["appControl"] = None
+            continue
+        # PipeWire channel gains are linear; use the usual cubic UI scale.
+        source["appControl"] = {
+            "volume": round(max(volumes) ** (1 / 3) * 100, 1),
+            "volumeMixed": max(volumes) - min(volumes) > 0.00001,
+            "mute": all(member["controls"]["mute"] for member in members),
+            "muteMixed": len({member["controls"]["mute"] for member in members}) > 1,
+        }
 
     sort_key = lambda endpoint: (
         KIND_ORDER.get(endpoint["kind"], 99),
@@ -332,6 +358,75 @@ def save_state(state: dict) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def validate_app_settings(value: object) -> dict:
+    if not isinstance(value, dict) or not value or value.keys() - {"volume", "mute"}:
+        fail("App settings require volume and/or mute")
+    if "volume" in value and (type(value["volume"]) not in (int, float)
+            or not 0 <= value["volume"] <= 100):
+        fail("App volume must be a number between 0 and 100")
+    if "mute" in value and type(value["mute"]) is not bool:
+        fail("App mute must be a boolean")
+    return dict(value)
+
+
+def apply_app_settings(source: dict, record: dict, force: dict | None = None) -> bool:
+    # Persist per-field acknowledgements by server/stream lifetime, not live values.
+    # Polls and fresh helper processes must not fight another mixer's later edits.
+    applied = record.setdefault("applied", {})
+    live = {member["lifetime"] for member in source["members"]}
+    record["applied"] = applied = {k: v for k, v in applied.items() if k in live}
+    success = True
+    for member in source["members"]:
+        previous = applied.get(member["lifetime"], {})
+        pending = {k: v for k, v in record["settings"].items()
+                   if k in (force or {}) or previous.get(k) != v}
+        if not pending:
+            continue
+        applied[member["lifetime"]] = {k: v for k, v in previous.items() if k not in pending}
+        # Re-resolve identity and serial immediately before addressing a numeric ID.
+        current = normalize_graph(pipewire_dump())
+        group = next((s for s in current["sources"] if s["key"] == source["key"]), None)
+        target = next((m for m in (group or {}).get("members", [])
+                       if m["lifetime"] == member["lifetime"]), None)
+        if not target or not group.get("appControl"):
+            success = False
+            continue
+        props = {}
+        if "volume" in pending:
+            props["channelVolumes"] = [(pending["volume"] / 100) ** 3] * len(
+                target["controls"]["channelVolumes"])
+        if "mute" in pending:
+            props["mute"] = pending["mute"]
+        try:
+            result = subprocess.run(["pw-cli", "set-param", str(target["id"]), "Props",
+                                     json.dumps(props)], capture_output=True, text=True, timeout=5)
+            # pw-cli reports command errors on stderr even with exit status zero.
+            if result.returncode or any(line.startswith("Error:") for line in result.stderr.splitlines()):
+                success = False
+                continue
+        except (OSError, subprocess.SubprocessError):
+            success = False
+            continue
+        applied[member["lifetime"]] = {**previous, **pending}
+    return success
+
+
+def set_app_settings(key: str, value: object) -> None:
+    settings = validate_app_settings(value)
+    with state_lock():
+        graph = normalize_graph(pipewire_dump())
+        source = endpoint(graph, "sources", key)
+        if not source["key"].startswith("app:") or not source.get("appControl"):
+            fail("Volume and mute require an identified playback application with supported controls")
+        state = load_state()
+        record = state.setdefault("apps", {}).setdefault(source["key"], {"settings": {}, "applied": {}})
+        record["settings"].update(settings)
+        success = apply_app_settings(source, record, force=settings)
+        save_state(state)
+    if not success:
+        fail("Some application streams could not be updated; saved settings will retry")
 
 
 def endpoint_by_name(graph: dict, collection: str, name: str) -> dict | None:
@@ -614,6 +709,18 @@ def reconcile_routes() -> dict:
     with state_lock():
         state = load_state()
         changed = False
+        if state.get("apps"):
+            graph = normalize_graph(pipewire_dump())
+            for key, record in state["apps"].items():
+                old = json.dumps(record, sort_keys=True)
+                source = next((s for s in graph["sources"] if s["key"] == key), None)
+                if source:
+                    if source.get("appControl"):
+                        validate_app_settings(record["settings"])
+                        apply_app_settings(source, record)
+                else:
+                    record["applied"] = {}
+                changed = changed or old != json.dumps(record, sort_keys=True)
         for route in state["routes"]:
             old = dict(route)
             try:
@@ -1073,6 +1180,14 @@ def main(arguments: list[str]) -> None:
     if command == "watch" and len(arguments) == 1:
         watch_graph()
         return
+    if command == "app-set" and len(arguments) == 3:
+        try:
+            settings = json.loads(arguments[2])
+        except json.JSONDecodeError:
+            fail("App settings must be valid JSON")
+        set_app_settings(arguments[1], settings)
+        emit_snapshot()
+        return
     if command in ("connect", "disconnect", "toggle") and len(arguments) == 3:
         output_node = arguments[1]
         input_node = arguments[2]
@@ -1099,7 +1214,7 @@ def main(arguments: list[str]) -> None:
     fail(
         "Usage: oma-aux [snapshot|watch|meters|toggle OUT_NODE IN_NODE|connect OUT_NODE "
         "IN_NODE|disconnect OUT_NODE IN_NODE|filter-set OUT_NODE IN_NODE JSON|"
-        "filter-clear OUT_NODE IN_NODE]"
+        "filter-clear OUT_NODE IN_NODE|app-set APP_KEY JSON]"
     )
 
 

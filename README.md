@@ -23,6 +23,19 @@ its node-name identity; unidentified streams stay separate and are not restored
 across stream/server recreation. Anonymous streams without serials or a known
 local server lifetime cannot be reliably restored across helper invocations.
 
+Each identified playback application has one 0-100% volume slider and mute
+button affecting every member stream, independently of route EQ/pan. Mute does
+not change volume, and moving the slider does not unmute. Volume uses the usual
+cubic scale; a group shows its highest channel volume, with `*` for differing
+volumes and `MIXED` for differing mute states. Clicking `MIXED` mutes all members.
+Unsupported or unidentified streams have no app controls. External changes are
+shown on the watcher's roughly two-second refresh, not continuously overridden.
+Only settings explicitly changed in Oma Aux are saved, under `apps` alongside
+the existing route records in `routes.json`. They apply to new/recreated member
+streams even with the panel closed; restarting the watcher leaves already
+handled live streams alone. Hardware volume, defaults, and route filters are
+untouched. Slider updates are coalesced at 120 ms intervals.
+
 ## Preview
 
 ![Oma Aux routing graph](preview.png)
@@ -35,6 +48,7 @@ local server lifetime cannot be reliably restored across helper invocations.
 - PipeWire
 - `pw-dump`
 - `pw-link`
+- `pw-cli` (application volume/mute and route filters)
 - `pw-record` (optional live meters; raw float capture support) and WirePlumber
 - Python 3.10 or newer
 
@@ -103,6 +117,8 @@ bin/oma-aux connect OUTPUT_NODE INPUT_NODE
 bin/oma-aux disconnect OUTPUT_NODE INPUT_NODE
 bin/oma-aux filter-set OUTPUT_NODE INPUT_NODE '{"pan":0,"eq":[0,0,0,0,0]}'
 bin/oma-aux filter-clear OUTPUT_NODE INPUT_NODE
+bin/oma-aux app-set 'app:application.process.binary:firefox:out' '{"volume":65}'
+bin/oma-aux app-set 'app:application.process.binary:firefox:out' '{"mute":true}'
 ```
 
 Endpoint keys from `snapshot` can replace numeric node IDs (the panel uses

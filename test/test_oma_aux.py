@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import array
 import json
+import tempfile
 import unittest
 from contextlib import nullcontext
 from unittest import mock
@@ -605,6 +606,164 @@ class ApplicationRouteTests(unittest.TestCase):
     def test_orphaned_ports_are_ignored(self):
         objects = self.node(1, "gone", "Stream/Output/Audio", "out")
         self.assertEqual(oma_aux.normalize_graph(objects[1:])["sources"], [])
+
+
+class ApplicationVolumeTests(unittest.TestCase):
+    key = "app:application.process.binary:firefox:out"
+
+    def objects(self, ids=(10, 11)):
+        objects = ApplicationRouteTests().objects(ids)
+        for obj in objects:
+            if obj["type"] == "PipeWire:Interface:Node":
+                obj["info"]["params"] = {"Props": [{"volume": 1, "channelVolumes": [0.125, 0.125],
+                                                  "mute": False}]}
+        return objects
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        directory = pathlib.Path(self.temporary.name)
+        for name, value in (("STATE_DIR", directory), ("STATE_PATH", directory / "routes.json"),
+                            ("LOCK_PATH", directory / "routes.lock")):
+            patch = mock.patch.object(oma_aux, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.dump = mock.patch.object(oma_aux, "pipewire_dump", return_value=self.objects()).start()
+        self.run = mock.patch.object(oma_aux.subprocess, "run",
+                                     return_value=mock.Mock(returncode=0, stderr="")).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_validation_is_strict_and_before_graph_or_state_access(self):
+        for value in ({}, [], {"volume": True}, {"volume": "50"}, {"volume": -1},
+                      {"volume": 101}, {"volume": float("nan")}, {"volume": float("inf")},
+                      {"volume": 10 ** 400},
+                      {"mute": 1}, {"mute": "false"}, {"pan": 0}):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                oma_aux.set_app_settings(self.key, value)
+        self.dump.assert_not_called()
+        self.run.assert_not_called()
+        self.assertFalse(oma_aux.STATE_PATH.exists())
+        for volume in (0, 100, 33.5):
+            self.assertEqual(oma_aux.validate_app_settings({"volume": volume}), {"volume": volume})
+
+    def test_live_group_max_mixed_mute_and_unsupported(self):
+        objects = self.objects()
+        objects[0]["info"]["params"]["Props"][0].update(channelVolumes=[0.001, 0.008], mute=True)
+        graph = oma_aux.normalize_graph(objects)
+        control = oma_aux.endpoint(graph, "sources", self.key)["appControl"]
+        self.assertEqual(control, {"volume": 50, "volumeMixed": True, "mute": False, "muteMixed": True})
+        objects[0]["info"]["params"] = {}
+        self.assertIsNone(oma_aux.endpoint(oma_aux.normalize_graph(objects), "sources", self.key)["appControl"])
+
+    def test_group_volume_persistence_and_mute_retains_volume_without_routes(self):
+        route = {"id": "untouched", "filter": {"pan": .5, "eq": [1, 2, 3, 4, 5]}}
+        oma_aux.save_state({"version": 1, "routes": [route], "extra": {"keep": True}})
+        oma_aux.set_app_settings("11", {"volume": 40})
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["10", "11"])
+        for call in self.run.call_args_list:
+            props = json.loads(call.args[0][4])
+            self.assertEqual(list(props), ["channelVolumes"])
+            for gain in props["channelVolumes"]:
+                self.assertAlmostEqual(gain, .064)
+        self.run.reset_mock()
+        oma_aux.set_app_settings(self.key, {"mute": True})
+        oma_aux.set_app_settings(self.key, {"mute": False})
+        self.assertEqual([json.loads(c.args[0][4]) for c in self.run.call_args_list],
+                         [{"mute": True}] * 2 + [{"mute": False}] * 2)
+        state = oma_aux.load_state()
+        self.assertEqual(state["routes"], [route])
+        self.assertEqual(state["extra"], {"keep": True})
+        self.assertEqual(state["apps"][self.key]["settings"], {"volume": 40, "mute": False})
+
+    def test_reconcile_restores_only_new_lifetimes_and_does_not_fight_external_changes(self):
+        oma_aux.set_app_settings(self.key, {"volume": 25, "mute": True})
+        self.run.reset_mock()
+        # The mocked graph still reports an external 50%, unmuted. No reapply,
+        # including after reloading persisted state in a fresh helper invocation.
+        oma_aux.reconcile_routes()
+        oma_aux.reconcile_routes()
+        self.run.assert_not_called()
+        self.dump.return_value = self.objects((10, 11, 12))
+        oma_aux.reconcile_routes()
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["12"])
+        self.run.reset_mock()
+        self.dump.return_value = self.objects(())
+        oma_aux.reconcile_routes()
+        self.dump.return_value = self.objects((40, 41))
+        oma_aux.reconcile_routes()
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["40", "41"])
+        for call in self.run.call_args_list:
+            self.assertEqual(json.loads(call.args[0][4]), {"channelVolumes": [.015625] * 2, "mute": True})
+        self.assertEqual(oma_aux.load_state()["routes"], [])
+
+    def test_reused_id_or_changed_server_is_a_new_lifetime(self):
+        oma_aux.set_app_settings(self.key, {"volume": 0})
+        self.run.reset_mock()
+        objects = self.objects()
+        objects[0]["info"]["props"]["object.serial"] = "9999"
+        self.dump.return_value = objects
+        oma_aux.reconcile_routes()
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["10"])
+        self.run.reset_mock()
+        objects.append({"type": "PipeWire:Interface:Core", "info": {"cookie": "new-server"}})
+        oma_aux.reconcile_routes()
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["10", "11"])
+
+    def test_temporarily_unavailable_controls_do_not_reset_handled_members(self):
+        oma_aux.set_app_settings(self.key, {"volume": 25})
+        self.run.reset_mock()
+        objects = self.objects()
+        objects[0]["info"]["params"] = {}
+        self.dump.return_value = objects
+        oma_aux.reconcile_routes()
+        self.dump.return_value = self.objects()
+        oma_aux.reconcile_routes()
+        self.run.assert_not_called()
+
+    def test_failed_member_retries_without_reapplying_successful_members(self):
+        self.run.side_effect = [mock.Mock(returncode=1), mock.Mock(returncode=0, stderr="")]
+        with self.assertRaises(SystemExit):
+            oma_aux.set_app_settings(self.key, {"mute": True})
+        self.run.side_effect = None
+        self.run.reset_mock()
+        oma_aux.reconcile_routes()
+        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["10"])
+        self.run.reset_mock()
+        # Explicitly reasserting the same saved value must also retry on failure.
+        self.run.return_value = mock.Mock(returncode=1)
+        with self.assertRaises(SystemExit):
+            oma_aux.set_app_settings(self.key, {"mute": True})
+        self.run.return_value = mock.Mock(returncode=0, stderr="")
+        self.run.reset_mock()
+        oma_aux.reconcile_routes()
+        self.assertEqual(self.run.call_count, 2)
+
+    def test_identity_recheck_never_targets_replacement_or_hardware(self):
+        objects = self.objects()
+        self.dump.side_effect = [objects, self.objects(()), self.objects(())]
+        with self.assertRaises(SystemExit):
+            oma_aux.set_app_settings(self.key, {"volume": 100})
+        self.run.assert_not_called()
+        self.dump.side_effect = None
+        fixture = ApplicationRouteTests()
+        self.dump.return_value = (fixture.node(1, "anonymous", "Stream/Output/Audio", "out")
+                                  + fixture.node(2, "hardware", "Audio/Source", "out"))
+        for key in ("1", "2"):
+            with self.assertRaises(SystemExit):
+                oma_aux.set_app_settings(key, {"mute": True})
+        self.run.assert_not_called()
+
+    def test_pw_cli_zero_exit_errors_retry_but_warnings_do_not(self):
+        self.run.return_value = mock.Mock(returncode=0, stderr='Error: "unknown global"\n')
+        with self.assertRaises(SystemExit):
+            oma_aux.set_app_settings(self.key, {"mute": True})
+        self.run.return_value = mock.Mock(returncode=0, stderr='W mod.rt: RTKit unavailable\n')
+        self.run.reset_mock()
+        oma_aux.reconcile_routes()
+        self.assertEqual(self.run.call_count, 2)
+        self.run.reset_mock()
+        oma_aux.reconcile_routes()
+        self.run.assert_not_called()
 
 
 class MeterTests(unittest.TestCase):
