@@ -1,6 +1,8 @@
 import importlib.machinery
 import importlib.util
 import pathlib
+import array
+import json
 import unittest
 from contextlib import nullcontext
 from unittest import mock
@@ -603,6 +605,127 @@ class ApplicationRouteTests(unittest.TestCase):
     def test_orphaned_ports_are_ignored(self):
         objects = self.node(1, "gone", "Stream/Output/Audio", "out")
         self.assertEqual(oma_aux.normalize_graph(objects[1:])["sources"], [])
+
+
+class MeterTests(unittest.TestCase):
+    def test_group_max_silence_stale_and_partial_capture(self):
+        targets = {'group': ('1', '2')}
+        children = {'1': {'last': 10, 'peak': [.5, .1]},
+                    '2': {'last': 10, 'peak': [.2, .75]}}
+        self.assertEqual(oma_aux.meter_levels(targets, children, 10.1), {'group': [.5, .75]})
+        for child in children.values():
+            child['peak'] = [0, 0]
+        self.assertEqual(oma_aux.meter_levels(targets, children, 10.2), {'group': [0, 0]})
+        self.assertEqual(oma_aux.meter_levels(targets, children, 11), {'group': None})
+        del children['2']
+        self.assertEqual(oma_aux.meter_levels(targets, children, 10.1), {'group': [0, 0]})
+
+    def test_corked_member_does_not_hide_playing_stream(self):
+        targets = {'app': ('75599', '80084')}
+        children = {'75599': {'last': 0, 'peak': [0, 0]},
+                    '80084': {'last': 10, 'peak': [.6, .4]}}
+        self.assertEqual(oma_aux.meter_levels(targets, children, 10.1), {'app': [.6, .4]})
+        # Ignore stale peaks too, including when the previously active member stops.
+        children['75599'] = {'last': 9, 'peak': [.9, .9]}
+        self.assertEqual(oma_aux.meter_levels(targets, children, 10.1), {'app': [.6, .4]})
+        self.assertEqual(oma_aux.meter_levels(targets, children, 11), {'app': None})
+        self.assertEqual(oma_aux.meter_levels(targets, {}, 11), {'app': None})
+
+    def test_pcm_stereo_fragmentation_and_nonfinite_values(self):
+        data = array.array("f", [-.25, .5, float("nan"), float("inf"), 2, -.75]).tobytes()
+        peak, tail = oma_aux.pcm_peaks(data[:11])
+        self.assertEqual(peak, [.25, .5])
+        self.assertEqual(len(tail), 3)
+        self.assertEqual(oma_aux.pcm_peaks(tail + data[11:]), ([1, .75], b""))
+        self.assertEqual(oma_aux.pcm_peaks(bytes(16)), ([0, 0], b""))
+
+    def test_targets_group_members_share_sink_capture_and_require_serial(self):
+        objects = ApplicationRouteTests().objects()
+        graph = oma_aux.normalize_graph(objects)
+        targets = oma_aux.meter_targets(graph)
+        self.assertEqual(targets['app:application.process.binary:firefox:out'], ('1010', '1011'))
+        sink = graph['destinations'][0]
+        graph['sources'].append({**sink, 'key': 'speakers:out'})
+        self.assertEqual(oma_aux.meter_targets(graph)['speakers:out'], targets['speakers:in'])
+        sink['serial'] = ''
+        self.assertNotIn('speakers:in', oma_aux.meter_targets(graph))
+
+    def test_capture_is_passive_explicit_and_never_playback(self):
+        command = oma_aux.meter_command('1234')
+        self.assertEqual(command[0], 'pw-record')
+        self.assertEqual(command[command.index('--target') + 1], '1234')
+        props = json.loads(command[command.index('--properties') + 1])
+        for key in ('stream.monitor', 'stream.capture.sink', 'node.passive',
+                    'node.dont-fallback', 'node.dont-reconnect', 'node.dont-move'):
+            self.assertTrue(props[key])
+        self.assertFalse(props['object.linger'])
+
+    def test_meter_nodes_and_links_hidden_even_from_internal_graph(self):
+        fixture = ApplicationRouteTests()
+        objects = fixture.objects() + fixture.node(50, 'oma_aux_meter_test', 'Stream/Input/Audio', 'in')
+        objects.append({'id': 900, 'type': 'PipeWire:Interface:Link', 'info': {
+            'output-node-id': 10, 'output-port-id': 100,
+            'input-node-id': 50, 'input-port-id': 500}})
+        for internal in (False, True):
+            graph = oma_aux.normalize_graph(objects, include_managed=internal)
+            self.assertNotIn(50, [x['id'] for x in graph['destinations']])
+            self.assertEqual(graph['links'], [])
+
+    def test_pool_cap_churn_and_exit_cleanup_without_route_access(self):
+        processes = []
+        handlers = {}
+        selector = mock.Mock()
+        ticks = iter(range(100))
+        def spawn(*args, **kwargs):
+            process = mock.Mock()
+            process.poll.return_value = None
+            processes.append(process)
+            return process
+        def select(**kwargs):
+            if len(processes) > oma_aux.METER_LIMIT:
+                handlers[oma_aux.signal.SIGTERM](None, None)
+            return []
+        selector.select.side_effect = select
+        targets = {str(i): (str(i + 1),) for i in range(20)}
+        with (
+            mock.patch.object(oma_aux.signal, 'signal', side_effect=lambda sig, fn: handlers.update({sig: fn})),
+            mock.patch.object(oma_aux.selectors, 'DefaultSelector', return_value=selector),
+            mock.patch.object(oma_aux.time, 'monotonic', side_effect=lambda: next(ticks)),
+            mock.patch.object(oma_aux, 'pipewire_dump', return_value=[]),
+            mock.patch.object(oma_aux, 'meter_targets', side_effect=[targets, {'new': ('100',)}]),
+            mock.patch.object(oma_aux.subprocess, 'Popen', side_effect=spawn),
+            mock.patch.object(oma_aux, 'load_state') as load,
+            mock.patch.object(oma_aux, 'reconcile_routes') as reconcile,
+            mock.patch('builtins.print'),
+        ):
+            oma_aux.watch_meters()
+        self.assertEqual(len(processes), oma_aux.METER_LIMIT + 1)
+        for process in processes:
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once()
+            process.stdout.close.assert_called_once()
+        load.assert_not_called()
+        reconcile.assert_not_called()
+        selector.close.assert_called_once()
+
+    def test_missing_capture_tool_emits_unavailable_and_exits_cleanly(self):
+        handlers = {}
+        selector = mock.Mock()
+        def select(**kwargs):
+            handlers[oma_aux.signal.SIGTERM](None, None)
+            return []
+        selector.select.side_effect = select
+        with (
+            mock.patch.object(oma_aux.signal, 'signal', side_effect=lambda sig, fn: handlers.update({sig: fn})),
+            mock.patch.object(oma_aux.selectors, 'DefaultSelector', return_value=selector),
+            mock.patch.object(oma_aux, 'pipewire_dump', return_value=[]),
+            mock.patch.object(oma_aux, 'meter_targets', return_value={'app': ('100',)}),
+            mock.patch.object(oma_aux.subprocess, 'Popen', side_effect=FileNotFoundError),
+            mock.patch('builtins.print') as output,
+        ):
+            oma_aux.watch_meters()
+        self.assertEqual(json.loads(output.call_args.args[0]), {'levels': {'app': None}})
+        selector.close.assert_called_once()
 
 
 class ToggleTests(unittest.TestCase):

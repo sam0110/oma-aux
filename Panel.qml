@@ -20,6 +20,7 @@ Panel {
   property var editorEq: [0, 0, 0, 0, 0]
   property bool loading: false
   property string error: ""
+  property var meterLevels: ({})
   property string pendingConnection: ""
   property string drawingSourceKey: ""
   property real drawingX: 0
@@ -204,8 +205,62 @@ Panel {
       loading = sources.length === 0
       error = ""
     } else {
+      meterLevels = ({})
       pendingConnection = ""
       drawingSourceKey = ""
+    }
+  }
+
+  Process {
+    id: meterProc
+    command: [root.pluginDir + "/bin/oma-aux", "meters"]
+    running: root.opened
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (!root.opened) return
+        try { root.meterLevels = JSON.parse(line).levels || ({}) } catch (e) {}
+      }
+    }
+    onExited: root.meterLevels = ({})
+  }
+
+  component PeakMeter: Item {
+    id: meter
+    required property string endpointKey
+    readonly property var peaks: root.meterLevels[endpointKey] || null
+    width: Style.space(22)
+    height: Style.space(38)
+    Row {
+      anchors.top: parent.top
+      anchors.horizontalCenter: parent.horizontalCenter
+      spacing: Style.space(3)
+      Repeater {
+        model: 2
+        Rectangle {
+          required property int index
+          readonly property real peak: meter.peaks ? meter.peaks[index] : 0
+          width: Style.space(6)
+          height: Style.space(26)
+          radius: Style.space(1)
+          color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, meter.peaks ? 0.14 : 0.05)
+          Rectangle {
+            anchors.bottom: parent.bottom
+            width: parent.width
+            height: parent.height * Math.max(0, Math.min(1, (20 * Math.log(Math.max(0.001, parent.peak)) / Math.LN10 + 60) / 60))
+            radius: parent.radius
+            color: parent.peak >= 0.99 ? "#dc6565" : Color.accent
+          }
+        }
+      }
+    }
+    Text {
+      anchors.bottom: parent.bottom
+      anchors.horizontalCenter: parent.horizontalCenter
+      text: peaks ? "LR" : "--"
+      color: root.bar.foreground
+      opacity: 0.45
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.caption * 0.75
     }
   }
 
@@ -558,7 +613,7 @@ Panel {
 
                 Column {
                   anchors.left: parent.left
-                  anchors.right: sourceSocket.left
+                  anchors.right: sourceMeter.left
                   anchors.verticalCenter: parent.verticalCenter
                   anchors.leftMargin: Style.space(10)
                   anchors.rightMargin: Style.space(10)
@@ -582,6 +637,14 @@ Panel {
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
                   }
+                }
+
+                PeakMeter {
+                  id: sourceMeter
+                  endpointKey: modelData.key
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(12)
+                  anchors.verticalCenter: parent.verticalCenter
                 }
 
                 Rectangle {
@@ -668,7 +731,7 @@ Panel {
                   spacing: Style.space(8)
 
                   Column {
-                    width: parent.width - destinationMark.width - parent.spacing
+                    width: Math.max(0, parent.width - destinationMark.width - destinationMeter.width - parent.spacing * 2)
                     spacing: Style.space(2)
 
                     Text {
@@ -689,6 +752,12 @@ Panel {
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
                     }
+                  }
+
+                  PeakMeter {
+                    id: destinationMeter
+                    endpointKey: modelData.key
+                    anchors.verticalCenter: parent.verticalCenter
                   }
 
                   Text {

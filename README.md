@@ -25,7 +25,7 @@ local server lifetime cannot be reliably restored across helper invocations.
 
 ## Preview
 
-![Oma Aux routing graph](preview1.png)
+![Oma Aux routing graph](preview.png)
 
 ![Oma Aux balance and equalizer controls](preview2.png)
 
@@ -35,6 +35,7 @@ local server lifetime cannot be reliably restored across helper invocations.
 - PipeWire
 - `pw-dump`
 - `pw-link`
+- `pw-record` (optional live meters; raw float capture support) and WirePlumber
 - Python 3.10 or newer
 
 These are present on a standard Omarchy installation.
@@ -52,6 +53,22 @@ omarchy plugin remove sam0110.oma-aux
 ```
 
 ## Current Scope
+
+Stereo PCM peak meters run only while the panel is open, independently of the
+always-on route watcher. Left/right bars use a -60 to 0 dBFS scale (red at
+clipping); `--` means unavailable, not silence. Application groups show the
+maximum of each channel across all members, not their sum. Outputs measure
+their sink monitor mix, not an estimate from incoming routes. PipeWire performs
+stereo conversion for mono/multichannel nodes; these are sample peaks, not true
+peak or loudness measurements. Recording/filter endpoints without supported
+monitoring show `--`.
+
+Monitoring uses at most 16 `pw-record` children, shared by sink and monitor rows,
+with 10 Hz numeric-only UI updates and one-second graph discovery. Groups that
+do not fit the cap are unavailable. Passive, serial-targeted capture links do
+not change defaults or existing routes and have no playback/loopback path.
+Suspended nodes may be unavailable; capture failures retry after five seconds.
+Captures are removed on panel close, helper exit, or target disappearance.
 
 - Live node, port, and link discovery
 - Audio-only filtering
@@ -80,6 +97,7 @@ The bundled helper can also inspect or change the graph directly:
 ```bash
 bin/oma-aux snapshot
 bin/oma-aux watch
+bin/oma-aux meters  # Read-only peak JSON; Ctrl-C stops all captures
 bin/oma-aux toggle OUTPUT_NODE INPUT_NODE
 bin/oma-aux connect OUTPUT_NODE INPUT_NODE
 bin/oma-aux disconnect OUTPUT_NODE INPUT_NODE

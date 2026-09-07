@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import array
+import ctypes
 import hashlib
 import json
 import math
@@ -31,6 +33,8 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 STATE_PATH = STATE_DIR / "routes.json"
 LOCK_PATH = STATE_DIR / "routes.lock"
 MANAGED_PREFIX = "oma_aux_route_"
+METER_PREFIX = "oma_aux_meter_"
+METER_LIMIT = 16
 PROCESS_TOKEN = str(time.time_ns())
 
 
@@ -175,7 +179,11 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
         for node_id, props in nodes.items()
         if str(props.get("node.name") or "").startswith(MANAGED_PREFIX)
     }
+    meter_node_ids = {node_id for node_id, props in nodes.items()
+                      if str(props.get("node.name") or "").startswith(METER_PREFIX)}
     for node_id, directions in ports_by_node.items():
+        if node_id in meter_node_ids:
+            continue
         if node_id in managed_node_ids and not include_managed:
             continue
         props = nodes.get(node_id, {})
@@ -241,6 +249,8 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
                 continue
             output_node = int(info["output-node-id"])
             input_node = int(info["input-node-id"])
+            if output_node in meter_node_ids or input_node in meter_node_ids:
+                continue
             if not include_managed and (
                 output_node in managed_node_ids or input_node in managed_node_ids
             ):
@@ -916,8 +926,147 @@ def watch_graph() -> None:
         fail(message or "PipeWire graph monitor stopped unexpectedly")
 
 
+def meter_targets(graph: dict) -> dict[str, tuple[str, ...]]:
+    targets = {}
+    for item in graph["sources"] + graph["destinations"]:
+        if item["mediaClass"] not in ("Stream/Output/Audio", "Audio/Sink", "Audio/Source"):
+            continue
+        members = item.get("members", [item])
+        serials = tuple(sorted({m["serial"] for m in members}))
+        if serials and all(s.isdigit() and int(s) > 0 for s in serials):
+            targets[item["key"]] = serials
+    return targets
+
+
+def meter_command(serial: str) -> list[str]:
+    return ["pw-record", "--raw", "--format", "f32", "--rate", "48000",
+            "--channels", "2", "--channel-map", "FL,FR", "--latency", "50ms",
+            "--target", serial, "--properties", json.dumps({
+                "node.name": f"{METER_PREFIX}{os.getpid()}_{serial}",
+                "stream.monitor": True, "stream.capture.sink": True,
+                "node.passive": True, "node.dont-fallback": True,
+                "node.dont-reconnect": True, "node.dont-move": True,
+                "object.linger": False,
+            }), "-"]
+
+
+def pcm_peaks(data: bytes) -> tuple[list[float], bytes]:
+    end = len(data) - len(data) % 8
+    samples = array.array("f")
+    samples.frombytes(data[:end])
+    return [min(1.0, max((abs(v) for v in samples[ch::2] if math.isfinite(v)),
+                         default=0.0)) for ch in (0, 1)], data[end:]
+
+
+def meter_levels(targets: dict, children: dict, now: float) -> dict:
+    levels = {}
+    for key, serials in targets.items():
+        # Corked application streams may never deliver PCM. They must not
+        # hide fresh peaks from other streams in the same application group.
+        fresh = [children[s] for s in serials
+                 if s in children and now - children[s]["last"] < 0.5]
+        levels[key] = ([max(child["peak"][ch] for child in fresh)
+                        for ch in (0, 1)] if fresh else None)
+    return levels
+
+
+def watch_meters() -> None:
+    # This path deliberately never loads, reconciles, or writes saved routes.
+    stopping = False
+    parent = os.getppid()
+    children = {}
+    targets = {}
+    retry = {}
+    selector = selectors.DefaultSelector()
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    def child_setup():
+        # Also reap captures if the helper is killed rather than terminated.
+        ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+        if os.getppid() != helper_pid:
+            os._exit(1)
+
+    def retire(serial):
+        child = children.pop(serial)
+        process = child["process"]
+        selector.unregister(process.stdout)
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+
+    helper_pid = os.getpid()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    refresh = emit = 0.0
+    try:
+        while not stopping and os.getppid() == parent:
+            now = time.monotonic()
+            if now >= refresh:
+                try:
+                    targets = meter_targets(normalize_graph(pipewire_dump()))
+                except SystemExit:
+                    targets = {}
+                wanted = set()
+                for serials in targets.values():
+                    if len(wanted | set(serials)) <= METER_LIMIT:
+                        wanted.update(serials)
+                for serial in list(children):
+                    if serial not in wanted:
+                        retire(serial)
+                retry = {s: due for s, due in retry.items() if s in wanted}
+                for serial in sorted(wanted - children.keys()):
+                    if stopping or now < retry.get(serial, 0):
+                        continue
+                    try:
+                        process = subprocess.Popen(meter_command(serial), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            bufsize=0, preexec_fn=child_setup)
+                    except OSError:
+                        retry[serial] = now + 5
+                        continue
+                    children[serial] = {"process": process, "tail": b"", "peak": [0.0, 0.0],
+                                        "last": 0.0}
+                    selector.register(process.stdout, selectors.EVENT_READ, serial)
+                refresh = time.monotonic() + 1
+            for key, _mask in selector.select(timeout=0.05):
+                serial = key.data
+                child = children[serial]
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    retire(serial)
+                    retry[serial] = time.monotonic() + 5
+                    continue
+                peaks, child["tail"] = pcm_peaks(child["tail"] + chunk)
+                child["peak"] = [max(a, b) for a, b in zip(child["peak"], peaks)]
+                child["last"] = time.monotonic()
+            now = time.monotonic()
+            if now >= emit:
+                levels = meter_levels(targets, children, now)
+                print(json.dumps({"levels": levels}, separators=(",", ":")), flush=True)
+                for child in children.values():
+                    child["peak"] = [0.0, 0.0]
+                emit = now + 0.1
+    except BrokenPipeError:
+        pass
+    finally:
+        for serial in list(children):
+            retire(serial)
+        selector.close()
+
+
 def main(arguments: list[str]) -> None:
     command = arguments[0] if arguments else "snapshot"
+    if command == "meters" and len(arguments) == 1:
+        watch_meters()
+        return
     if command == "snapshot" and len(arguments) == 1:
         emit_snapshot()
         return
@@ -948,7 +1097,7 @@ def main(arguments: list[str]) -> None:
         emit_snapshot()
         return
     fail(
-        "Usage: oma-aux [snapshot|watch|toggle OUT_NODE IN_NODE|connect OUT_NODE "
+        "Usage: oma-aux [snapshot|watch|meters|toggle OUT_NODE IN_NODE|connect OUT_NODE "
         "IN_NODE|disconnect OUT_NODE IN_NODE|filter-set OUT_NODE IN_NODE JSON|"
         "filter-clear OUT_NODE IN_NODE]"
     )
