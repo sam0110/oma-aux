@@ -28,6 +28,18 @@ the EQ provides ±12 dB at 100 Hz, 250 Hz, 1 kHz, 4 kHz, and 10 kHz.
 
 These are present on a standard Omarchy installation.
 
+## Installation
+
+```bash
+omarchy plugin add https://github.com/sam0110/oma-aux.git --enable
+```
+
+## Removal
+
+```bash
+omarchy plugin remove sam0110.oma-aux
+```
+
 ## Current Scope
 
 - Live node, port, and link discovery
