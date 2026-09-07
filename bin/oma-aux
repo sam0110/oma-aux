@@ -558,7 +558,7 @@ def filter_module_arguments(route: dict, generation: str) -> tuple[str, str, str
         f'filter.graph = {{ nodes = [ {" ".join(nodes)} ] links = [ {" ".join(links)} ] '
         f'inputs = [ {" ".join(inputs)} ] outputs = [ {" ".join(outputs)} ] }} '
         f'audio.channels = 2 audio.position = [ FL FR ] '
-        f'capture.props = {{ node.name = "{capture_name}" media.class = "Audio/Sink" '
+        f'capture.props = {{ node.name = "{capture_name}" media.class = "Stream/Input/Audio" '
         f'node.autoconnect = false stream.dont-remix = true }} '
         f'playback.props = {{ node.name = "{playback_name}" node.passive = true '
         f'node.autoconnect = false stream.dont-remix = true }} }}'

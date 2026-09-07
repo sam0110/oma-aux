@@ -124,7 +124,7 @@ class NormalizeTests(unittest.TestCase):
                 "type": "PipeWire:Interface:Node",
                 "info": {"props": {
                     "node.name": "oma_aux_route_test_input",
-                    "media.class": "Audio/Sink",
+                    "media.class": "Stream/Input/Audio",
                 }},
             },
             {
@@ -159,6 +159,8 @@ class FilterTests(unittest.TestCase):
             "filter": {"pan": -0.25, "eq": [1, 2, 3, 4, 5]},
         }
         arguments, capture, playback = oma_aux.filter_module_arguments(route, "1")
+        self.assertIn(f'capture.props = {{ node.name = "{capture}" media.class = "Stream/Input/Audio"', arguments)
+        self.assertNotIn('media.class = "Audio/Sink"', arguments)
         self.assertIn('"Gain 1" = 1.0000', arguments)
         self.assertIn('"Gain 1" = 0.7500', arguments)
         self.assertIn('label = bq_lowshelf', arguments)
@@ -457,7 +459,7 @@ class ApplicationRouteTests(unittest.TestCase):
     def test_every_member_uses_one_filter_after_pause_resume(self):
         route = self.route(oma_aux.normalize_graph(self.objects()))
         public = self.objects((40, 41))
-        managed = public + self.node(50, route["captureName"], "Audio/Sink", "in")
+        managed = public + self.node(50, route["captureName"], "Stream/Input/Audio", "in")
         managed += self.node(60, route["playbackName"], "Audio/Source", "out")
         managed += [{"id": 900 + i, "type": "PipeWire:Interface:Link", "info": {
             "output-node-id": node, "output-port-id": node * 10 + ch,
