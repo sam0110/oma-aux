@@ -13,8 +13,11 @@ Panel {
 
   readonly property string pluginDir: Qt.resolvedUrl(".").toString()
     .replace(/^file:\/\//, "").replace(/\/$/, "")
-  property var graph: ({ "sources": [], "destinations": [], "links": [] })
+  property var graph: ({ "sources": [], "destinations": [], "links": [], "routes": [], "filterBands": [] })
   property string selectedSourceKey: ""
+  property string selectedRouteId: ""
+  property real editorPan: 0
+  property var editorEq: [0, 0, 0, 0, 0]
   property bool loading: false
   property string error: ""
   property string pendingConnection: ""
@@ -24,10 +27,12 @@ Panel {
 
   readonly property var sources: graph.sources || []
   readonly property var destinations: graph.destinations || []
-  readonly property var links: graph.links || []
-  readonly property int routeCount: countRoutes(links)
+  readonly property var routes: graph.routes || []
+  readonly property var filterBands: graph.filterBands || []
+  readonly property int routeCount: routes.length
   readonly property var selectedSource: sourceByKey(selectedSourceKey)
   readonly property int selectedSourceId: selectedSource ? selectedSource.id : -1
+  readonly property var selectedRoute: routeById(selectedRouteId)
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -38,33 +43,37 @@ Panel {
     return null
   }
 
-  function linksBetween(outputNode, inputNode) {
-    var found = []
-    for (var i = 0; i < links.length; i++) {
-      var link = links[i]
-      if (link.outputNode === outputNode && link.inputNode === inputNode)
-        found.push(link)
-    }
-    return found
+  function destinationByKey(key) {
+    for (var i = 0; i < destinations.length; i++)
+      if (destinations[i].key === key) return destinations[i]
+    return null
   }
 
-  function countRoutes(allLinks) {
-    var routes = ({})
-    for (var i = 0; i < allLinks.length; i++)
-      routes[allLinks[i].outputNode + ":" + allLinks[i].inputNode] = true
-    return Object.keys(routes).length
+  function routeById(id) {
+    for (var i = 0; i < routes.length; i++)
+      if (routes[i].id === id) return routes[i]
+    return null
+  }
+
+  function routeBetween(source, destination) {
+    if (!source || !destination) return null
+    for (var i = 0; i < routes.length; i++) {
+      var route = routes[i]
+      if (route.sourceId === source.id && route.destinationId === destination.id)
+        return route
+    }
+    return null
+  }
+
+  function endpointIndex(collection, key) {
+    for (var i = 0; i < collection.length; i++)
+      if (collection[i].key === key) return i
+    return -1
   }
 
   function connectionState(source, destination) {
-    if (!source || !destination) return "disconnected"
-    var count = linksBetween(source.id, destination.id).length
-    if (count === 0) return "disconnected"
-    var outputCount = (source.ports || []).length
-    var inputCount = (destination.ports || []).length
-    var expected = outputCount === 1 || inputCount === 1
-      ? Math.max(outputCount, inputCount)
-      : Math.min(outputCount, inputCount)
-    return count >= expected ? "connected" : "partial"
+    var route = routeBetween(source, destination)
+    return route ? route.status : "disconnected"
   }
 
   function kindLabel(kind) {
@@ -90,12 +99,14 @@ Panel {
     if (!opened) return
     try {
       var parsed = JSON.parse(String(line || ""))
-      if (!parsed.sources || !parsed.destinations || !parsed.links) return
+      if (!parsed.sources || !parsed.destinations || !parsed.links || !parsed.routes) return
       graph = parsed
       loading = false
       error = ""
       if (!selectedSource)
         selectedSourceKey = sources.length ? sources[0].key : ""
+      if (selectedRouteId !== "" && !selectedRoute)
+        selectedRouteId = ""
     } catch (e) {
       error = "Could not understand the PipeWire graph"
       loading = false
@@ -115,12 +126,61 @@ Panel {
     actionProc.running = true
   }
 
+  function selectRoute(route) {
+    selectedRouteId = route.id
+    selectedSourceKey = route.sourceKey
+    editorPan = Number((route.filter || {}).pan || 0)
+    var gains = (route.filter || {}).eq || [0, 0, 0, 0, 0]
+    editorEq = gains.slice(0)
+    Qt.callLater(revealRouteEditor)
+  }
+
+  function revealRouteEditor() {
+    if (!selectedRoute || !routeEditorCard.visible) return
+    var flickable = outerScroll.contentItem
+    var editorY = routeEditorCard.mapToItem(contentColumn, 0, 0).y
+    var maximumY = Math.max(0, flickable.contentHeight - flickable.height)
+    flickable.contentY = Math.min(maximumY, Math.max(0, editorY - Style.space(12)))
+  }
+
+  function setFilter() {
+    if (!selectedRoute || actionProc.running) return
+    error = ""
+    actionProc.command = [
+      pluginDir + "/bin/oma-aux",
+      "filter-set",
+      String(selectedRoute.sourceId),
+      String(selectedRoute.destinationId),
+      JSON.stringify({ "pan": editorPan, "eq": editorEq })
+    ]
+    actionProc.running = true
+  }
+
+  function clearFilter() {
+    if (!selectedRoute || actionProc.running) return
+    error = ""
+    actionProc.command = [
+      pluginDir + "/bin/oma-aux",
+      "filter-clear",
+      String(selectedRoute.sourceId),
+      String(selectedRoute.destinationId)
+    ]
+    actionProc.running = true
+  }
+
+  function updateEq(index, value) {
+    var gains = editorEq.slice(0)
+    gains[index] = Math.round(value * 10) / 10
+    editorEq = gains
+  }
+
   function toggleConnection(destinationId) {
     toggleConnectionFor(selectedSourceId, destinationId)
   }
 
   function beginConnection(sourceKey, point) {
     selectedSourceKey = sourceKey
+    selectedRouteId = ""
     drawingSourceKey = sourceKey
     drawingX = point.x
     drawingY = point.y
@@ -362,12 +422,14 @@ Panel {
               anchors.fill: parent
               property var graphData: root.graph
               property string highlightedSource: root.selectedSourceKey
+              property string highlightedRoute: root.selectedRouteId
               property string drawingSource: root.drawingSourceKey
               property real pointerX: root.drawingX
               property real pointerY: root.drawingY
 
               onGraphDataChanged: requestPaint()
               onHighlightedSourceChanged: requestPaint()
+              onHighlightedRouteChanged: requestPaint()
               onDrawingSourceChanged: requestPaint()
               onPointerXChanged: requestPaint()
               onPointerYChanged: requestPaint()
@@ -385,6 +447,7 @@ Panel {
                     var destination = root.destinations[destinationIndex]
                     var state = root.connectionState(source, destination)
                     if (state === "disconnected") continue
+                    var route = root.routeBetween(source, destination)
 
                     var x1 = graphBoard.nodeWidth
                     var y1 = sourceIndex * graphBoard.rowPitch + graphBoard.nodeHeight / 2
@@ -397,14 +460,16 @@ Panel {
                     ctx.strokeStyle = source.key === root.selectedSourceKey
                       ? Color.accent
                       : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.42)
-                    ctx.lineWidth = state === "partial" ? 2 : 3
+                    ctx.lineWidth = route && route.id === root.selectedRouteId
+                      ? 5
+                      : (state === "partial" || state === "waiting" ? 2 : 3)
                     ctx.stroke()
 
                     var middleX = (x1 + x2) / 2
                     var middleY = (y1 + y2) / 2
                     ctx.beginPath()
                     ctx.arc(middleX, middleY, Style.space(4), 0, Math.PI * 2)
-                    ctx.fillStyle = state === "partial"
+                    ctx.fillStyle = state === "partial" || state === "waiting"
                       ? Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.65)
                       : Color.accent
                     ctx.fill()
@@ -431,6 +496,43 @@ Panel {
             }
 
             Repeater {
+              model: root.routes
+
+              delegate: Rectangle {
+                required property var modelData
+                readonly property int sourceIndex: root.endpointIndex(root.sources, modelData.sourceKey)
+                readonly property int destinationIndex: root.endpointIndex(root.destinations, modelData.destinationKey)
+                visible: sourceIndex >= 0 && destinationIndex >= 0
+                x: graphBoard.width / 2 - width / 2
+                y: ((sourceIndex + destinationIndex) * graphBoard.rowPitch + graphBoard.nodeHeight) / 2 - height / 2
+                width: Style.space(28)
+                height: width
+                radius: width / 2
+                color: root.selectedRouteId === modelData.id
+                  ? Color.accent
+                  : root.bar.background
+                border.width: 2
+                border.color: Color.accent
+
+                Text {
+                  anchors.centerIn: parent
+                  text: modelData.filtered ? "EQ" : "+"
+                  color: root.selectedRouteId === modelData.id ? root.bar.background : Color.accent
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: modelData.filtered ? Style.font.caption : Style.font.body
+                  font.bold: true
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.selectRoute(modelData)
+                }
+              }
+            }
+
+            Repeater {
               model: root.sources
 
               delegate: CursorSurface {
@@ -448,7 +550,10 @@ Panel {
 
                 MouseArea {
                   anchors.fill: parent
-                  onClicked: root.selectedSourceKey = modelData.key
+                  onClicked: {
+                    root.selectedSourceKey = modelData.key
+                    root.selectedRouteId = ""
+                  }
                 }
 
                 Column {
@@ -600,13 +705,250 @@ Panel {
           }
 
           Text {
+            visible: !root.selectedRoute
             width: parent.width
-            text: "Drag from a source socket to a destination, or select a source and click destinations. One source can feed many destinations."
+            text: "Choose a route marker to add pan and EQ, or drag from a source socket to create another route."
             color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.48)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
+          }
+
+          Rectangle {
+            id: routeEditorCard
+            visible: !!root.selectedRoute
+            width: parent.width
+            implicitHeight: filterEditor.implicitHeight + Style.space(24)
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.045)
+            border.width: 1
+            border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.12)
+
+            Column {
+              id: filterEditor
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(12)
+              spacing: Style.space(10)
+
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: parent.width - closeRoute.width - parent.spacing
+                  text: {
+                    var route = root.selectedRoute
+                    if (!route) return ""
+                    var source = root.sourceByKey(route.sourceKey)
+                    var destination = root.destinationByKey(route.destinationKey)
+                    return (source ? source.label : "Source") + "  →  " + (destination ? destination.label : "Destination")
+                  }
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  id: closeRoute
+                  text: "×"
+                  color: root.bar.foreground
+                  opacity: closeArea.containsMouse ? 1 : 0.55
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.title
+
+                  MouseArea {
+                    id: closeArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(6)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.selectedRouteId = ""
+                  }
+                }
+              }
+
+              Text {
+                visible: root.selectedRoute && !root.selectedRoute.filtered
+                width: parent.width
+                text: "Insert a stereo processor on this route for independent balance and five-band equalization."
+                color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.62)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Rectangle {
+                visible: root.selectedRoute && !root.selectedRoute.filtered
+                width: Style.space(150)
+                height: Style.space(34)
+                radius: height / 2
+                color: enableFilterArea.containsMouse
+                  ? Style.hoverFillFor(root.bar.foreground, Color.accent)
+                  : Style.selectedFillFor(root.bar.foreground, Color.accent)
+                opacity: actionProc.running ? 0.5 : 1
+
+                Text {
+                  anchors.centerIn: parent
+                  text: actionProc.running ? "STARTING…" : "ADD PAN + EQ"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                MouseArea {
+                  id: enableFilterArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  enabled: !actionProc.running
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setFilter()
+                }
+              }
+
+              Column {
+                visible: root.selectedRoute && root.selectedRoute.filtered
+                width: parent.width
+                spacing: Style.space(8)
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(10)
+
+                  Text {
+                    width: Style.space(72)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "PAN"
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "L"
+                    color: root.bar.foreground
+                    opacity: 0.55
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Slider {
+                    id: panSlider
+                    width: parent.width - Style.space(190)
+                    anchors.verticalCenter: parent.verticalCenter
+                    from: -1
+                    to: 1
+                    stepSize: 0.05
+                    value: root.editorPan
+                    enabled: !actionProc.running
+                    onMoved: root.editorPan = Math.round(value * 100) / 100
+                    onPressedChanged: if (!pressed && root.selectedRoute && root.selectedRoute.filtered) root.setFilter()
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "R"
+                    color: root.bar.foreground
+                    opacity: 0.55
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: Style.space(54)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.editorPan === 0
+                      ? "CENTER"
+                      : Math.round(Math.abs(root.editorPan) * 100) + "% " + (root.editorPan < 0 ? "L" : "R")
+                    color: Color.accent
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    horizontalAlignment: Text.AlignRight
+                  }
+                }
+
+                Text {
+                  text: "EQUALIZER"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Repeater {
+                  model: root.filterBands
+
+                  delegate: Row {
+                    required property var modelData
+                    required property int index
+                    width: filterEditor.width
+                    spacing: Style.space(10)
+
+                    Text {
+                      width: Style.space(72)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: modelData
+                      color: root.bar.foreground
+                      opacity: 0.72
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Slider {
+                      width: parent.width - Style.space(150)
+                      anchors.verticalCenter: parent.verticalCenter
+                      from: -12
+                      to: 12
+                      stepSize: 0.5
+                      value: Number(root.editorEq[index] || 0)
+                      enabled: !actionProc.running
+                      onMoved: root.updateEq(index, value)
+                      onPressedChanged: if (!pressed && root.selectedRoute && root.selectedRoute.filtered) root.setFilter()
+                    }
+
+                    Text {
+                      width: Style.space(58)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: {
+                        var gain = Number(root.editorEq[index] || 0)
+                        return (gain > 0 ? "+" : "") + gain.toFixed(1) + " dB"
+                      }
+                      color: Number(root.editorEq[index] || 0) === 0 ? root.bar.foreground : Color.accent
+                      opacity: Number(root.editorEq[index] || 0) === 0 ? 0.55 : 1
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      horizontalAlignment: Text.AlignRight
+                    }
+                  }
+                }
+
+                Text {
+                  text: "REMOVE FILTERS"
+                  color: removeFilterArea.containsMouse ? Color.accent : root.bar.foreground
+                  opacity: actionProc.running ? 0.35 : 0.62
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+
+                  MouseArea {
+                    id: removeFilterArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(5)
+                    hoverEnabled: true
+                    enabled: !actionProc.running
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.clearFilter()
+                  }
+                }
+              }
+            }
           }
         }
         }

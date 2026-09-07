@@ -3,14 +3,34 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
+from contextlib import contextmanager
+from pathlib import Path
+
+import fcntl
+
+
+FILTER_BANDS = (
+    ("100 Hz", "bq_lowshelf", 100),
+    ("250 Hz", "bq_peaking", 250),
+    ("1 kHz", "bq_peaking", 1000),
+    ("4 kHz", "bq_peaking", 4000),
+    ("10 kHz", "bq_highshelf", 10000),
+)
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "oma-aux"
+STATE_PATH = STATE_DIR / "routes.json"
+LOCK_PATH = STATE_DIR / "routes.lock"
+MANAGED_PREFIX = "oma_aux_route_"
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -80,7 +100,7 @@ KIND_ORDER = {
 }
 
 
-def normalize_graph(objects: list[dict]) -> dict:
+def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
     nodes: dict[int, dict] = {}
     raw_ports: list[tuple[int, dict]] = []
     raw_links: list[dict] = []
@@ -119,7 +139,14 @@ def normalize_graph(objects: list[dict]) -> dict:
 
     sources: list[dict] = []
     destinations: list[dict] = []
+    managed_node_ids = {
+        node_id
+        for node_id, props in nodes.items()
+        if str(props.get("node.name") or "").startswith(MANAGED_PREFIX)
+    }
     for node_id, directions in ports_by_node.items():
+        if node_id in managed_node_ids and not include_managed:
+            continue
         props = nodes.get(node_id, {})
         media_class = str(props.get("media.class") or "")
         base_label = node_label(props)
@@ -160,12 +187,18 @@ def normalize_graph(objects: list[dict]) -> dict:
             input_port = int(info["input-port-id"])
             if output_port not in audio_port_ids or input_port not in audio_port_ids:
                 continue
+            output_node = int(info["output-node-id"])
+            input_node = int(info["input-node-id"])
+            if not include_managed and (
+                output_node in managed_node_ids or input_node in managed_node_ids
+            ):
+                continue
             links.append(
                 {
                     "id": int(obj["id"]),
-                    "outputNode": int(info["output-node-id"]),
+                    "outputNode": output_node,
                     "outputPort": output_port,
-                    "inputNode": int(info["input-node-id"]),
+                    "inputNode": input_node,
                     "inputPort": input_port,
                     "state": str(info.get("state") or ""),
                 }
@@ -176,8 +209,342 @@ def normalize_graph(objects: list[dict]) -> dict:
     return {"sources": sources, "destinations": destinations, "links": links}
 
 
+def route_id(source_name: str, destination_name: str) -> str:
+    value = f"{source_name}\0{destination_name}".encode()
+    return hashlib.sha256(value).hexdigest()[:16]
+
+
+def default_filter() -> dict:
+    return {"pan": 0.0, "eq": [0.0] * len(FILTER_BANDS)}
+
+
+def validate_filter(value: object) -> dict:
+    if not isinstance(value, dict):
+        fail("Filter settings must be a JSON object")
+    try:
+        pan = float(value.get("pan", 0.0))
+        eq = [float(gain) for gain in value.get("eq", [])]
+    except (TypeError, ValueError):
+        fail("Pan and EQ values must be numbers")
+    if not math.isfinite(pan) or not -1.0 <= pan <= 1.0:
+        fail("Pan must be between -1 and 1")
+    if len(eq) != len(FILTER_BANDS):
+        fail(f"EQ requires {len(FILTER_BANDS)} band gains")
+    if any(not math.isfinite(gain) or not -12.0 <= gain <= 12.0 for gain in eq):
+        fail("EQ gains must be between -12 and 12 dB")
+    return {"pan": round(pan, 3), "eq": [round(gain, 1) for gain in eq]}
+
+
+@contextmanager
+def state_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE_PATH.read_text())
+        if not isinstance(value, dict) or not isinstance(value.get("routes"), list):
+            raise ValueError
+        return value
+    except FileNotFoundError:
+        return {"version": 1, "routes": []}
+    except (OSError, json.JSONDecodeError, ValueError):
+        fail(f"Could not read {STATE_PATH}")
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="routes.", suffix=".json", dir=STATE_DIR)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(state, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, STATE_PATH)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def endpoint_by_name(graph: dict, collection: str, name: str) -> dict | None:
+    return next((item for item in graph.get(collection, []) if item["name"] == name), None)
+
+
+def process_start_time(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[21]
+    except (OSError, IndexError):
+        return ""
+
+
+def route_process_alive(route: dict) -> bool:
+    try:
+        pid = int(route.get("pid", 0))
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        pid > 0
+        and route.get("processStart") == process_start_time(pid)
+        and f"oma_aux_route_{route['id']}" in command
+    )
+
+
+def stop_route_process(route: dict) -> None:
+    if not route_process_alive(route):
+        return
+    pid = int(route["pid"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(20):
+        if not route_process_alive(route):
+            return
+        time.sleep(0.025)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def filter_module_arguments(route: dict, generation: str) -> tuple[str, str, str]:
+    settings = route["filter"]
+    capture_name = f"{MANAGED_PREFIX}{route['id']}_{generation}_input"
+    playback_name = f"{MANAGED_PREFIX}{route['id']}_{generation}_output"
+    nodes = []
+    links = []
+    inputs = []
+    outputs = []
+    pan = settings["pan"]
+    channel_gains = (1.0 - max(0.0, pan), 1.0 + min(0.0, pan))
+
+    for channel, channel_gain in zip(("l", "r"), channel_gains, strict=True):
+        previous = ""
+        for index, ((_, label, frequency), gain) in enumerate(
+            zip(FILTER_BANDS, settings["eq"], strict=True)
+        ):
+            name = f"{channel}_eq_{index}"
+            nodes.append(
+                f'{{ type = builtin name = {name} label = {label} '
+                f'control = {{ "Freq" = {frequency}.0 "Q" = 1.0 "Gain" = {gain:.1f} }} }}'
+            )
+            if previous:
+                links.append(f'{{ output = "{previous}:Out" input = "{name}:In" }}')
+            else:
+                inputs.append(f'"{name}:In"')
+            previous = name
+        gain_name = f"{channel}_gain"
+        nodes.append(
+            f'{{ type = builtin name = {gain_name} label = mixer '
+            f'control = {{ "Gain 1" = {channel_gain:.4f} }} }}'
+        )
+        links.append(f'{{ output = "{previous}:Out" input = "{gain_name}:In 1" }}')
+        outputs.append(f'"{gain_name}:Out"')
+
+    arguments = (
+        f'{{ node.description = "Oma Aux route {route["id"]}" '
+        f'filter.graph = {{ nodes = [ {" ".join(nodes)} ] links = [ {" ".join(links)} ] '
+        f'inputs = [ {" ".join(inputs)} ] outputs = [ {" ".join(outputs)} ] }} '
+        f'audio.channels = 2 audio.position = [ FL FR ] '
+        f'capture.props = {{ node.name = "{capture_name}" media.class = "Audio/Sink" '
+        f'node.autoconnect = false stream.dont-remix = true }} '
+        f'playback.props = {{ node.name = "{playback_name}" node.passive = true '
+        f'node.autoconnect = false stream.dont-remix = true }} }}'
+    )
+    return arguments, capture_name, playback_name
+
+
+def filter_control_params(settings: dict) -> list[tuple[str, float]]:
+    pan = settings["pan"]
+    channel_gains = (1.0 - max(0.0, pan), 1.0 + min(0.0, pan))
+    parameters = []
+    for channel, channel_gain in zip(("l", "r"), channel_gains, strict=True):
+        parameters.extend(
+            (f"{channel}_eq_{index}:Gain", gain)
+            for index, gain in enumerate(settings["eq"])
+        )
+        parameters.append((f"{channel}_gain:Gain 1", channel_gain))
+    return parameters
+
+
+def set_filter_controls(route: dict, settings: dict) -> None:
+    graph = normalize_graph(pipewire_dump(), include_managed=True)
+    capture = endpoint_by_name(graph, "destinations", route["captureName"])
+    if not capture:
+        fail("PipeWire route filter disappeared")
+    values = " ".join(
+        f"{json.dumps(name)} {value:.4f}"
+        for name, value in filter_control_params(settings)
+    )
+    try:
+        result = subprocess.run(
+            [
+                "pw-cli",
+                "set-param",
+                str(capture["id"]),
+                "Props",
+                f"{{ params = [ {values} ] }}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        fail("pw-cli is required")
+    except subprocess.SubprocessError as error:
+        fail(f"Could not update route filter: {error}")
+    if result.returncode != 0:
+        fail(result.stderr.strip() or "Could not update route filter")
+
+
+def spawn_route_process(route: dict) -> None:
+    generation = str(time.time_ns())
+    arguments, capture_name, playback_name = filter_module_arguments(route, generation)
+    command = f"load-module libpipewire-module-filter-chain {arguments}"
+    marker = f"oma_aux_route_{route['id']}"
+    process = subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            '(printf "%s\\n" "$1"; exec sleep infinity) | exec pw-cli',
+            marker,
+            command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    route.update(
+        {
+            "pid": process.pid,
+            "processStart": process_start_time(process.pid),
+            "captureName": capture_name,
+            "playbackName": playback_name,
+        }
+    )
+
+
+def wait_for_processor(route: dict) -> tuple[dict, dict, dict]:
+    for _ in range(40):
+        graph = normalize_graph(pipewire_dump(), include_managed=True)
+        capture = endpoint_by_name(graph, "destinations", route["captureName"])
+        playback = endpoint_by_name(graph, "sources", route["playbackName"])
+        if capture and playback:
+            return graph, capture, playback
+        if not route_process_alive(route):
+            break
+        time.sleep(0.05)
+    stop_route_process(route)
+    fail("PipeWire could not start the route filter")
+
+
+def connect_endpoint_pair(graph: dict, source: dict, destination: dict) -> None:
+    existing = {
+        (link["outputPort"], link["inputPort"])
+        for link in graph["links"]
+        if link["outputNode"] == source["id"] and link["inputNode"] == destination["id"]
+    }
+    for output_port, input_port in channel_pairs(source["ports"], destination["ports"]):
+        if (output_port, input_port) not in existing:
+            run_pw_link("-L", str(output_port), str(input_port))
+
+
+def disconnect_endpoint_pair(graph: dict, source_id: int, destination_id: int) -> None:
+    for link in graph["links"]:
+        if link["outputNode"] == source_id and link["inputNode"] == destination_id:
+            run_pw_link("-d", str(link["id"]))
+
+
+def activate_route(route: dict) -> None:
+    public_graph = normalize_graph(pipewire_dump())
+    source = endpoint_by_name(public_graph, "sources", route["sourceName"])
+    destination = endpoint_by_name(public_graph, "destinations", route["destinationName"])
+    if not source or not destination:
+        route["status"] = "waiting"
+        return
+    if not route_process_alive(route):
+        spawn_route_process(route)
+    graph, capture, playback = wait_for_processor(route)
+    connect_endpoint_pair(graph, source, capture)
+    graph = normalize_graph(pipewire_dump(), include_managed=True)
+    connect_endpoint_pair(graph, playback, destination)
+    graph = normalize_graph(pipewire_dump(), include_managed=True)
+    disconnect_endpoint_pair(graph, source["id"], destination["id"])
+    route["status"] = "connected"
+
+
+def reconcile_routes() -> dict:
+    with state_lock():
+        state = load_state()
+        changed = False
+        for route in state["routes"]:
+            old = dict(route)
+            activate_route(route)
+            changed = changed or route != old
+        if changed:
+            save_state(state)
+        return state
+
+
+def direct_routes(graph: dict) -> list[dict]:
+    grouped: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for link in graph["links"]:
+        grouped[(link["outputNode"], link["inputNode"])].append(link)
+    routes = []
+    for (source_id, destination_id), links in grouped.items():
+        source = next((item for item in graph["sources"] if item["id"] == source_id), None)
+        destination = next(
+            (item for item in graph["destinations"] if item["id"] == destination_id), None
+        )
+        if not source or not destination:
+            continue
+        intended = set(channel_pairs(source["ports"], destination["ports"]))
+        existing = {(link["outputPort"], link["inputPort"]) for link in links}
+        routes.append(
+            {
+                "id": route_id(source["name"], destination["name"]),
+                "sourceId": source_id,
+                "sourceKey": source["key"],
+                "destinationId": destination_id,
+                "destinationKey": destination["key"],
+                "status": "connected" if intended and intended <= existing else "partial",
+                "filtered": False,
+                "filter": default_filter(),
+            }
+        )
+    return routes
+
+
 def graph_snapshot() -> dict:
-    return normalize_graph(pipewire_dump())
+    state = reconcile_routes()
+    graph = normalize_graph(pipewire_dump())
+    routes_by_id = {route["id"]: route for route in direct_routes(graph)}
+    for saved in state["routes"]:
+        source = endpoint_by_name(graph, "sources", saved["sourceName"])
+        destination = endpoint_by_name(graph, "destinations", saved["destinationName"])
+        if not source or not destination:
+            continue
+        routes_by_id[saved["id"]] = {
+            "id": saved["id"],
+            "sourceId": source["id"],
+            "sourceKey": source["key"],
+            "destinationId": destination["id"],
+            "destinationKey": destination["key"],
+            "status": saved.get("status", "waiting"),
+            "filtered": saved.get("enabled", True),
+            "filter": saved["filter"],
+        }
+    graph["routes"] = list(routes_by_id.values())
+    graph["filterBands"] = [name for name, _, _ in FILTER_BANDS]
+    return graph
 
 
 def emit_snapshot() -> None:
@@ -243,7 +610,7 @@ def run_pw_link(*arguments: str) -> None:
 
 
 def connect_nodes(output_node: int, input_node: int) -> None:
-    graph = graph_snapshot()
+    graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
     existing = {
@@ -257,20 +624,30 @@ def connect_nodes(output_node: int, input_node: int) -> None:
 
 
 def disconnect_nodes(output_node: int, input_node: int) -> None:
-    graph = graph_snapshot()
-    link_ids = [
-        link["id"]
-        for link in graph["links"]
-        if link["outputNode"] == output_node and link["inputNode"] == input_node
-    ]
-    for link_id in link_ids:
-        run_pw_link("-d", str(link_id))
+    graph = normalize_graph(pipewire_dump())
+    disconnect_endpoint_pair(graph, output_node, input_node)
 
 
 def toggle_nodes(output_node: int, input_node: int) -> None:
-    graph = graph_snapshot()
+    graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
+    with state_lock():
+        state = load_state()
+        saved = next(
+            (
+                route
+                for route in state["routes"]
+                if route["sourceName"] == source["name"]
+                and route["destinationName"] == destination["name"]
+            ),
+            None,
+        )
+        if saved:
+            stop_route_process(saved)
+            state["routes"].remove(saved)
+            save_state(state)
+            return
     intended = set(channel_pairs(source["ports"], destination["ports"]))
     matching_links = [
         link
@@ -285,6 +662,63 @@ def toggle_nodes(output_node: int, input_node: int) -> None:
         return
     for output_port, input_port in sorted(intended - existing):
         run_pw_link("-L", str(output_port), str(input_port))
+
+
+def set_route_filter(output_node: int, input_node: int, value: object) -> None:
+    settings = validate_filter(value)
+    graph = normalize_graph(pipewire_dump())
+    source = endpoint(graph, "sources", output_node)
+    destination = endpoint(graph, "destinations", input_node)
+    identifier = route_id(source["name"], destination["name"])
+    with state_lock():
+        state = load_state()
+        old_route = next(
+            (route for route in state["routes"] if route["id"] == identifier), None
+        )
+        if old_route and route_process_alive(old_route):
+            set_filter_controls(old_route, settings)
+            old_route["filter"] = settings
+            old_route["enabled"] = True
+            save_state(state)
+            return
+        route = {
+            "id": identifier,
+            "sourceName": source["name"],
+            "destinationName": destination["name"],
+            "filter": settings,
+            "enabled": True,
+            "status": "starting",
+        }
+        spawn_route_process(route)
+        try:
+            activate_route(route)
+        except BaseException:
+            stop_route_process(route)
+            raise
+        if old_route:
+            stop_route_process(old_route)
+            state["routes"].remove(old_route)
+        state["routes"].append(route)
+        save_state(state)
+
+
+def clear_route_filter(output_node: int, input_node: int) -> None:
+    graph = normalize_graph(pipewire_dump())
+    source = endpoint(graph, "sources", output_node)
+    destination = endpoint(graph, "destinations", input_node)
+    identifier = route_id(source["name"], destination["name"])
+    with state_lock():
+        state = load_state()
+        route = next((item for item in state["routes"] if item["id"] == identifier), None)
+        if not route:
+            return
+        if not route_process_alive(route):
+            activate_route(route)
+        settings = default_filter()
+        set_filter_controls(route, settings)
+        route["filter"] = settings
+        route["enabled"] = False
+        save_state(state)
 
 
 def watch_graph() -> None:
@@ -369,7 +803,23 @@ def main(arguments: list[str]) -> None:
             toggle_nodes(output_node, input_node)
         emit_snapshot()
         return
-    fail("Usage: oma-aux [snapshot|watch|toggle OUT_NODE IN_NODE|connect OUT_NODE IN_NODE|disconnect OUT_NODE IN_NODE]")
+    if command == "filter-set" and len(arguments) == 4:
+        try:
+            settings = json.loads(arguments[3])
+        except json.JSONDecodeError:
+            fail("Filter settings must be valid JSON")
+        set_route_filter(parse_node_id(arguments[1]), parse_node_id(arguments[2]), settings)
+        emit_snapshot()
+        return
+    if command == "filter-clear" and len(arguments) == 3:
+        clear_route_filter(parse_node_id(arguments[1]), parse_node_id(arguments[2]))
+        emit_snapshot()
+        return
+    fail(
+        "Usage: oma-aux [snapshot|watch|toggle OUT_NODE IN_NODE|connect OUT_NODE "
+        "IN_NODE|disconnect OUT_NODE IN_NODE|filter-set OUT_NODE IN_NODE JSON|"
+        "filter-clear OUT_NODE IN_NODE]"
+    )
 
 
 if __name__ == "__main__":
