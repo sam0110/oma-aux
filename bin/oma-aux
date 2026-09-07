@@ -207,7 +207,8 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
                     "id": node_id,
                     "key": endpoint_key(node_id, props, direction, str(session)),
                     "serial": str(props.get("object.serial") or ""),
-                    "lifetime": f"{session}:{props.get('object.serial', '')}:{node_id}",
+                    "lifetime": (f"{session}:{props['object.serial']}"
+                                 if props.get("object.serial") else f"{session}::{node_id}"),
                     "controls": controls.get(node_id, {}),
                     "name": name,
                     "label": label,
@@ -371,17 +372,45 @@ def validate_app_settings(value: object) -> dict:
     return dict(value)
 
 
-def apply_app_settings(source: dict, record: dict, force: dict | None = None) -> bool:
-    # Persist per-field acknowledgements by server/stream lifetime, not live values.
-    # Polls and fresh helper processes must not fight another mixer's later edits.
+def app_gain(settings: dict) -> float:
+    return 0.0 if settings.get("mute", False) else (settings.get("volume", 100) / 100) ** 3
+
+
+def apply_app_settings(
+    source: dict, record: dict, routes: list[dict], force: dict | None = None
+) -> bool:
     applied = record.setdefault("applied", {})
-    live = {member["lifetime"] for member in source["members"]}
-    record["applied"] = applied = {k: v for k, v in applied.items() if k in live}
     success = True
+    filtered = [route for route in routes if route.get("sourceKey") == source["key"]
+                and route.get("status") == "connected" and route_process_alive(route)]
+    if filtered:
+        try:
+            # Program attenuation before normalizing the client stream.
+            for route in filtered:
+                set_filter_controls(route, route["filter"], record["settings"])
+        except SystemExit:
+            return False
     for member in source["members"]:
+        # Migrate server:serial:node-id acknowledgements without replaying settings.
+        legacy = [key for key in applied if key.startswith(f'{member["lifetime"]}:')]
+        if member["lifetime"] not in applied and legacy:
+            applied[member["lifetime"]] = {
+                field: value for key in legacy for field, value in applied[key].items()
+            }
+        for key in legacy:
+            del applied[key]
         previous = applied.get(member["lifetime"], {})
-        pending = {k: v for k, v in record["settings"].items()
-                   if k in (force or {}) or previous.get(k) != v}
+        controls = member["controls"]
+        if filtered:
+            pending = dict(record["settings"]) if (
+                force or controls.get("mute") or any(
+                    not math.isclose(float(gain), 1.0, abs_tol=0.00001)
+                    for gain in controls.get("channelVolumes", [])
+                )
+            ) else {}
+        else:
+            pending = {field: value for field, value in record["settings"].items()
+                       if field in (force or {}) or previous.get(field) != value}
         if not pending:
             continue
         applied[member["lifetime"]] = {k: v for k, v in previous.items() if k not in pending}
@@ -394,11 +423,15 @@ def apply_app_settings(source: dict, record: dict, force: dict | None = None) ->
             success = False
             continue
         props = {}
-        if "volume" in pending:
-            props["channelVolumes"] = [(pending["volume"] / 100) ** 3] * len(
-                target["controls"]["channelVolumes"])
-        if "mute" in pending:
-            props["mute"] = pending["mute"]
+        if filtered:
+            props["channelVolumes"] = [1.0] * len(target["controls"]["channelVolumes"])
+            props["mute"] = False
+        else:
+            if "volume" in pending:
+                props["channelVolumes"] = [(pending["volume"] / 100) ** 3] * len(
+                    target["controls"]["channelVolumes"])
+            if "mute" in pending:
+                props["mute"] = pending["mute"]
         try:
             result = subprocess.run(["pw-cli", "set-param", str(target["id"]), "Props",
                                      json.dumps(props)], capture_output=True, text=True, timeout=5)
@@ -423,7 +456,7 @@ def set_app_settings(key: str, value: object) -> None:
         state = load_state()
         record = state.setdefault("apps", {}).setdefault(source["key"], {"settings": {}, "applied": {}})
         record["settings"].update(settings)
-        success = apply_app_settings(source, record, force=settings)
+        success = apply_app_settings(source, record, state["routes"], force=settings)
         save_state(state)
     if not success:
         fail("Some application streams could not be updated; saved settings will retry")
@@ -519,7 +552,9 @@ def stop_route_process(route: dict) -> None:
         pass
 
 
-def filter_module_arguments(route: dict, generation: str) -> tuple[str, str, str]:
+def filter_module_arguments(
+    route: dict, generation: str, app_settings: dict | None = None
+) -> tuple[str, str, str]:
     settings = route["filter"]
     capture_name = f"{MANAGED_PREFIX}{route['id']}_{generation}_input"
     playback_name = f"{MANAGED_PREFIX}{route['id']}_{generation}_output"
@@ -528,7 +563,9 @@ def filter_module_arguments(route: dict, generation: str) -> tuple[str, str, str
     inputs = []
     outputs = []
     pan = settings["pan"]
-    channel_gains = (1.0 - max(0.0, pan), 1.0 + min(0.0, pan))
+    gain = app_gain(app_settings or {})
+    channel_gains = (gain * (1.0 - max(0.0, pan)),
+                     gain * (1.0 + min(0.0, pan)))
 
     for channel, channel_gain in zip(("l", "r"), channel_gains, strict=True):
         previous = ""
@@ -566,9 +603,13 @@ def filter_module_arguments(route: dict, generation: str) -> tuple[str, str, str
     return arguments, capture_name, playback_name
 
 
-def filter_control_params(settings: dict) -> list[tuple[str, float]]:
+def filter_control_params(
+    settings: dict, app_settings: dict | None = None
+) -> list[tuple[str, float]]:
     pan = settings["pan"]
-    channel_gains = (1.0 - max(0.0, pan), 1.0 + min(0.0, pan))
+    gain = app_gain(app_settings or {})
+    channel_gains = (gain * (1.0 - max(0.0, pan)),
+                     gain * (1.0 + min(0.0, pan)))
     parameters = []
     for channel, channel_gain in zip(("l", "r"), channel_gains, strict=True):
         parameters.extend(
@@ -579,14 +620,16 @@ def filter_control_params(settings: dict) -> list[tuple[str, float]]:
     return parameters
 
 
-def set_filter_controls(route: dict, settings: dict) -> None:
+def set_filter_controls(
+    route: dict, settings: dict, app_settings: dict | None = None
+) -> None:
     graph = normalize_graph(pipewire_dump(), include_managed=True)
     capture = endpoint_by_name(graph, "destinations", route["captureName"])
     if not capture:
         fail("PipeWire route filter disappeared")
     values = " ".join(
         f"{json.dumps(name)} {value:.4f}"
-        for name, value in filter_control_params(settings)
+        for name, value in filter_control_params(settings, app_settings)
     )
     try:
         result = subprocess.run(
@@ -609,9 +652,11 @@ def set_filter_controls(route: dict, settings: dict) -> None:
         fail(result.stderr.strip() or "Could not update route filter")
 
 
-def spawn_route_process(route: dict) -> None:
+def spawn_route_process(route: dict, app_settings: dict | None = None) -> None:
     generation = str(time.time_ns())
-    arguments, capture_name, playback_name = filter_module_arguments(route, generation)
+    arguments, capture_name, playback_name = filter_module_arguments(
+        route, generation, app_settings
+    )
     command = f"load-module libpipewire-module-filter-chain {arguments}"
     marker = f"oma_aux_route_{route['id']}"
     process = subprocess.Popen(
@@ -668,7 +713,7 @@ def disconnect_endpoint_pair(graph: dict, source: dict, destination: dict) -> No
             run_pw_link("-d", str(link["id"]))
 
 
-def activate_route(route: dict) -> None:
+def activate_route(route: dict, app_settings: dict | None = None) -> None:
     public_graph = normalize_graph(pipewire_dump())
     source = saved_endpoint(public_graph, "sources", route, "source")
     destination = saved_endpoint(public_graph, "destinations", route, "destination")
@@ -677,8 +722,10 @@ def activate_route(route: dict) -> None:
             route["status"] = "waiting"
         return
     if not route_process_alive(route):
-        spawn_route_process(route)
+        spawn_route_process(route, app_settings)
     graph, capture, playback = wait_for_processor(route)
+    if app_settings is not None:
+        set_filter_controls(route, route["filter"], app_settings)
     source = saved_endpoint(graph, "sources", route, "source")
     destination = saved_endpoint(graph, "destinations", route, "destination")
     if not source or not destination:
@@ -709,27 +756,35 @@ def reconcile_routes() -> dict:
     with state_lock():
         state = load_state()
         changed = False
-        if state.get("apps"):
-            graph = normalize_graph(pipewire_dump())
-            for key, record in state["apps"].items():
-                old = json.dumps(record, sort_keys=True)
-                source = next((s for s in graph["sources"] if s["key"] == key), None)
-                if source:
-                    if source.get("appControl"):
-                        validate_app_settings(record["settings"])
-                        apply_app_settings(source, record)
-                else:
-                    record["applied"] = {}
-                changed = changed or old != json.dumps(record, sort_keys=True)
+        graph = normalize_graph(pipewire_dump())
         for route in state["routes"]:
             old = dict(route)
             try:
-                activate_route(route)
+                source = saved_endpoint(graph, "sources", route, "source")
+                record = (state.get("apps") or {}).get(route.get("sourceKey"), {})
+                if source and source.get("appControl"):
+                    before = json.dumps(record, sort_keys=True)
+                    settings = record.setdefault("settings", {})
+                    settings.setdefault("volume", source["appControl"]["volume"])
+                    settings.setdefault("mute", source["appControl"]["mute"])
+                    record.setdefault("applied", {})
+                    state.setdefault("apps", {})[source["key"]] = record
+                    changed = changed or before != json.dumps(record, sort_keys=True)
+                activate_route(route, record.get("settings"))
             except SystemExit:
                 # Graph objects can vanish between dump and link operations.
                 # Keep the saved intent and retry without killing the watcher.
                 route["status"] = "waiting"
             changed = changed or route != old
+        if state.get("apps"):
+            graph = normalize_graph(pipewire_dump())
+            for key, record in state["apps"].items():
+                old = json.dumps(record, sort_keys=True)
+                source = next((s for s in graph["sources"] if s["key"] == key), None)
+                if source and source.get("appControl"):
+                    validate_app_settings(record["settings"])
+                    apply_app_settings(source, record, state["routes"])
+                changed = changed or old != json.dumps(record, sort_keys=True)
         if changed:
             save_state(state)
         return state
@@ -771,6 +826,17 @@ def direct_routes(graph: dict) -> list[dict]:
 def graph_snapshot() -> dict:
     state = reconcile_routes()
     graph = normalize_graph(pipewire_dump())
+    filtered_keys = {route.get("sourceKey") for route in state["routes"]
+                     if route.get("status") == "connected"}
+    for source in graph["sources"]:
+        record = (state.get("apps") or {}).get(source["key"])
+        if source["key"] in filtered_keys and record and source.get("appControl"):
+            source["appControl"] = {
+                "volume": record["settings"].get("volume", source["appControl"]["volume"]),
+                "volumeMixed": False,
+                "mute": record["settings"].get("mute", source["appControl"]["mute"]),
+                "muteMixed": False,
+            }
     routes_by_id = {route["id"]: route for route in direct_routes(graph)}
     for saved in state["routes"]:
         source = saved_endpoint(graph, "sources", saved, "source")
@@ -869,7 +935,8 @@ def connect_nodes(output_node: int | str, input_node: int | str) -> None:
         state = load_state()
         saved = saved_route_for_endpoints(state, graph, source, destination)
         if saved:
-            activate_route(saved)
+            record = (state.get("apps") or {}).get(source["key"], {})
+            activate_route(saved, record.get("settings"))
             save_state(state)
             return
     connect_endpoint_pair(graph, source, destination)
@@ -885,6 +952,9 @@ def disconnect_nodes(output_node: int | str, input_node: int | str) -> None:
         if saved:
             stop_route_process(saved)
             state["routes"].remove(saved)
+            record = (state.get("apps") or {}).get(source["key"])
+            if record and source.get("appControl"):
+                apply_app_settings(source, record, state["routes"], force=record["settings"])
             save_state(state)
     disconnect_endpoint_pair(graph, source, destination)
 
@@ -899,6 +969,9 @@ def toggle_nodes(output_node: int | str, input_node: int | str) -> None:
         if saved:
             stop_route_process(saved)
             state["routes"].remove(saved)
+            record = (state.get("apps") or {}).get(source["key"])
+            if record and source.get("appControl"):
+                apply_app_settings(source, record, state["routes"], force=record["settings"])
             save_state(state)
             disconnect_endpoint_pair(graph, source, destination)
             return
@@ -927,11 +1000,21 @@ def set_route_filter(output_node: int | str, input_node: int | str, value: objec
     identifier = route_id(source["key"], destination["key"])
     with state_lock():
         state = load_state()
+        app_settings = None
+        if source.get("appControl"):
+            record = state.setdefault("apps", {}).setdefault(
+                source["key"], {"settings": {}, "applied": {}}
+            )
+            record["settings"].setdefault("volume", source["appControl"]["volume"])
+            record["settings"].setdefault("mute", source["appControl"]["mute"])
+            app_settings = record["settings"]
         old_route = saved_route_for_endpoints(state, graph, source, destination)
         if old_route and route_process_alive(old_route):
-            set_filter_controls(old_route, settings)
+            set_filter_controls(old_route, settings, app_settings)
             old_route["filter"] = settings
             old_route["enabled"] = True
+            if source.get("appControl"):
+                apply_app_settings(source, record, state["routes"], force=record["settings"])
             save_state(state)
             return
         route = {
@@ -944,9 +1027,9 @@ def set_route_filter(output_node: int | str, input_node: int | str, value: objec
             "enabled": True,
             "status": "starting",
         }
-        spawn_route_process(route)
+        spawn_route_process(route, app_settings)
         try:
-            activate_route(route)
+            activate_route(route, app_settings)
         except BaseException:
             stop_route_process(route)
             raise
@@ -954,6 +1037,8 @@ def set_route_filter(output_node: int | str, input_node: int | str, value: objec
             stop_route_process(old_route)
             state["routes"].remove(old_route)
         state["routes"].append(route)
+        if source.get("appControl"):
+            apply_app_settings(source, record, state["routes"], force=record["settings"])
         save_state(state)
 
 
@@ -967,11 +1052,18 @@ def clear_route_filter(output_node: int | str, input_node: int | str) -> None:
         if not route:
             return
         if not route_process_alive(route):
-            activate_route(route)
+            record = (state.get("apps") or {}).get(source["key"], {})
+            activate_route(route, record.get("settings"))
         settings = default_filter()
-        set_filter_controls(route, settings)
+        app_settings = ((state.get("apps") or {}).get(source["key"], {})
+                        .get("settings"))
+        set_filter_controls(route, settings, app_settings)
         route["filter"] = settings
         route["enabled"] = False
+        if source.get("appControl"):
+            record = (state.get("apps") or {}).get(source["key"])
+            if record:
+                apply_app_settings(source, record, state["routes"], force=record["settings"])
         save_state(state)
 
 

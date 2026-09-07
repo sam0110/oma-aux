@@ -24,14 +24,14 @@ across stream/server recreation. Anonymous streams without serials or a known
 local server lifetime cannot be reliably restored across helper invocations.
 
 Each identified playback application has one 0-100% volume slider and mute
-button affecting every member stream, independently of route EQ/pan. Mute does
-not change volume, and moving the slider does not unmute. Volume uses the usual
-cubic scale; a group shows its highest channel volume, with `*` for differing
-volumes and `MIXED` for differing mute states. Clicking `MIXED` mutes all members.
-Unsupported or unidentified streams have no app controls. External changes are
-shown on the watcher's roughly two-second refresh, not continuously overridden.
-Only settings explicitly changed in Oma Aux are saved, under `apps` alongside
-the existing route records in `routes.json`. They apply to new/recreated member
+button affecting every member stream. Mute does not change volume, and moving
+the slider does not unmute. Volume uses the usual cubic scale. For applications
+with an owned route, volume and mute are applied in the route filter and client
+streams are kept at unity/unmuted, so client resets cannot change audible gain.
+Without an owned route, controls apply directly to streams and clients may
+override them. Unsupported or unidentified streams have no app controls.
+Application settings are saved under `apps` alongside the existing route
+records in `routes.json`. They apply to new/recreated member
 streams even with the panel closed; restarting the watcher leaves already
 handled live streams alone. Hardware volume, defaults, and route filters are
 untouched. Slider updates are coalesced at 120 ms intervals.

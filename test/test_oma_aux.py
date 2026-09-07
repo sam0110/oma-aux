@@ -178,6 +178,19 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(controls["l_eq_2:Gain"], 3)
         self.assertEqual(controls["r_eq_4:Gain"], 5)
 
+    def test_app_volume_and_mute_multiply_pan_gain(self):
+        settings = {"pan": 0.25, "eq": [0] * 5}
+        controls = dict(oma_aux.filter_control_params(
+            settings, {"volume": 50, "mute": False}
+        ))
+        self.assertEqual(controls["l_gain:Gain 1"], 0.09375)
+        self.assertEqual(controls["r_gain:Gain 1"], 0.125)
+        muted = dict(oma_aux.filter_control_params(
+            settings, {"volume": 50, "mute": True}
+        ))
+        self.assertEqual(muted["l_gain:Gain 1"], 0)
+        self.assertEqual(muted["r_gain:Gain 1"], 0)
+
     @mock.patch.object(oma_aux.subprocess, "run")
     def test_updates_existing_filter_controls(self, run):
         run.return_value.returncode = 0
@@ -228,7 +241,7 @@ class FilterTests(unittest.TestCase):
             mock.patch.object(oma_aux, "stop_route_process") as stop,
         ):
             oma_aux.set_route_filter(1, 2, settings)
-        set_controls.assert_called_once_with(route, settings)
+        set_controls.assert_called_once_with(route, settings, None)
         spawn.assert_not_called()
         stop.assert_not_called()
         self.assertEqual(route["filter"], settings)
@@ -265,7 +278,7 @@ class FilterTests(unittest.TestCase):
             mock.patch.object(oma_aux, "connect_endpoint_pair") as connect,
         ):
             oma_aux.clear_route_filter(1, 2)
-        set_controls.assert_called_once_with(route, oma_aux.default_filter())
+        set_controls.assert_called_once_with(route, oma_aux.default_filter(), None)
         activate.assert_not_called()
         stop.assert_not_called()
         connect.assert_not_called()
@@ -569,8 +582,8 @@ class ApplicationRouteTests(unittest.TestCase):
             oma_aux.set_route_filter(11, 30, settings)
             self.assertEqual(len(state["routes"]), 1)
             route = state["routes"][0]
-            spawn.assert_called_once_with(route)
-            controls.assert_called_once_with(route, settings)
+            spawn.assert_called_once_with(route, None)
+            controls.assert_called_once_with(route, settings, None)
             oma_aux.connect_nodes(11, 30)
             self.assertEqual(activate.call_count, 2)
             link.assert_not_called()
@@ -677,26 +690,146 @@ class ApplicationVolumeTests(unittest.TestCase):
         self.assertEqual(state["extra"], {"keep": True})
         self.assertEqual(state["apps"][self.key]["settings"], {"volume": 40, "mute": False})
 
-    def test_reconcile_restores_only_new_lifetimes_and_does_not_fight_external_changes(self):
+    def test_routed_update_programs_filter_before_stream_unity(self):
+        source = oma_aux.endpoint(oma_aux.normalize_graph(self.objects()), "sources", self.key)
+        route = {"sourceKey": self.key, "status": "connected",
+                 "filter": {"pan": .25, "eq": [0] * 5}}
+        record = {"settings": {"volume": 41, "mute": False}, "applied": {}}
+        events = []
+
+        def run(*args, **kwargs):
+            events.append("stream")
+            return mock.Mock(returncode=0, stderr="")
+
+        with (
+            mock.patch.object(oma_aux, "route_process_alive", return_value=True),
+            mock.patch.object(oma_aux, "set_filter_controls",
+                              side_effect=lambda *args: events.append("filter")) as controls,
+            mock.patch.object(oma_aux.subprocess, "run", side_effect=run) as stream,
+        ):
+            self.assertTrue(oma_aux.apply_app_settings(
+                source, record, [route], force=record["settings"]
+            ))
+
+        self.assertEqual(events, ["filter", "stream", "stream"])
+        controls.assert_called_once_with(route, route["filter"], record["settings"])
+        for call in stream.call_args_list:
+            self.assertEqual(json.loads(call.args[0][4]),
+                             {"channelVolumes": [1.0, 1.0], "mute": False})
+
+    def test_routed_unity_reset_needs_no_stream_correction(self):
+        objects = self.objects()
+        for obj in objects:
+            if obj["type"] == "PipeWire:Interface:Node":
+                obj["info"]["params"]["Props"][0].update(
+                    channelVolumes=[1.0, 1.0], mute=False)
+        source = oma_aux.endpoint(oma_aux.normalize_graph(objects), "sources", self.key)
+        route = {"sourceKey": self.key, "status": "connected",
+                 "filter": {"pan": .25, "eq": [0] * 5}}
+        record = {"settings": {"volume": 41, "mute": False}, "applied": {
+            member["lifetime"]: {"volume": 41, "mute": False}
+            for member in source["members"]
+        }}
+        with (
+            mock.patch.object(oma_aux, "route_process_alive", return_value=True),
+            mock.patch.object(oma_aux, "set_filter_controls") as controls,
+        ):
+            self.assertTrue(oma_aux.apply_app_settings(source, record, [route]))
+        controls.assert_called_once_with(route, route["filter"], record["settings"])
+        self.run.assert_not_called()
+
+    def test_filtered_snapshot_uses_saved_effective_controls(self):
+        graph = oma_aux.normalize_graph(self.objects())
+        source = oma_aux.endpoint(graph, "sources", self.key)
+        destination = graph["destinations"][0]
+        route = {"id": oma_aux.route_id(source["key"], destination["key"]),
+                 "sourceKey": source["key"], "sourceName": source["name"],
+                 "destinationKey": destination["key"],
+                 "destinationName": destination["name"], "status": "connected",
+                 "enabled": True, "filter": oma_aux.default_filter()}
+        state = {"routes": [route], "apps": {self.key: {
+            "settings": {"volume": 41, "mute": True}, "applied": {}}}}
+        with mock.patch.object(oma_aux, "reconcile_routes", return_value=state):
+            snapshot = oma_aux.graph_snapshot()
+        control = oma_aux.endpoint(snapshot, "sources", self.key)["appControl"]
+        self.assertEqual(control, {"volume": 41, "volumeMixed": False,
+                                   "mute": True, "muteMixed": False})
+
+    def test_removing_final_filter_restores_direct_stream_controls(self):
+        graph = oma_aux.normalize_graph(self.objects())
+        source = oma_aux.endpoint(graph, "sources", self.key)
+        destination = graph["destinations"][0]
+        route = {"sourceKey": source["key"], "sourceName": source["name"],
+                 "destinationKey": destination["key"],
+                 "destinationName": destination["name"]}
+        record = {"settings": {"volume": 40, "mute": False}, "applied": {}}
+        state = {"routes": [route], "apps": {self.key: record}}
+        with (
+            mock.patch.object(oma_aux, "state_lock", return_value=nullcontext()),
+            mock.patch.object(oma_aux, "load_state", return_value=state),
+            mock.patch.object(oma_aux, "save_state"),
+            mock.patch.object(oma_aux, "stop_route_process"),
+            mock.patch.object(oma_aux, "apply_app_settings") as apply,
+        ):
+            oma_aux.disconnect_nodes(source["key"], destination["key"])
+        self.assertEqual(state["routes"], [])
+        apply.assert_called_once()
+        self.assertEqual(apply.call_args.args[1:], (record, []))
+        self.assertEqual(apply.call_args.kwargs, {"force": record["settings"]})
+
+    def test_unrouted_reconcile_does_not_fight_client_reset(self):
         oma_aux.set_app_settings(self.key, {"volume": 25, "mute": True})
         self.run.reset_mock()
-        # The mocked graph still reports an external 50%, unmuted. No reapply,
-        # including after reloading persisted state in a fresh helper invocation.
-        oma_aux.reconcile_routes()
+        for obj in self.dump.return_value:
+            if obj["type"] == "PipeWire:Interface:Node":
+                obj["info"]["params"]["Props"][0].update(
+                    channelVolumes=[1.0, 1.0], mute=True)
         oma_aux.reconcile_routes()
         self.run.assert_not_called()
-        self.dump.return_value = self.objects((10, 11, 12))
-        oma_aux.reconcile_routes()
-        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["12"])
+
+    def test_only_new_unrouted_stream_lifetime_gets_saved_volume(self):
+        oma_aux.set_app_settings(self.key, {"volume": 25})
         self.run.reset_mock()
         self.dump.return_value = self.objects(())
         oma_aux.reconcile_routes()
-        self.dump.return_value = self.objects((40, 41))
+
+        transitioned = self.objects((40, 41))
+        firefox = [obj for obj in transitioned if obj["type"] == "PipeWire:Interface:Node"
+                   and obj["info"]["props"].get("application.name") == "Firefox"]
+        for obj, serial in zip(firefox, ("1010", "1011"), strict=True):
+            obj["info"]["props"].update({"object.serial": serial, "media.name": "Next track"})
+            obj["info"]["params"]["Props"][0]["channelVolumes"] = [1.0, 1.0]
+        self.dump.return_value = transitioned
         oma_aux.reconcile_routes()
-        self.assertEqual([c.args[0][2] for c in self.run.call_args_list], ["40", "41"])
-        for call in self.run.call_args_list:
-            self.assertEqual(json.loads(call.args[0][4]), {"channelVolumes": [.015625] * 2, "mute": True})
-        self.assertEqual(oma_aux.load_state()["routes"], [])
+        self.run.assert_not_called()
+
+        self.run.reset_mock()
+        self.dump.return_value = self.objects((40, 41, 42))
+        for obj, serial in zip([
+            obj for obj in self.dump.return_value if obj["type"] == "PipeWire:Interface:Node"
+            and obj["info"]["props"].get("application.name") == "Firefox"
+        ], ("1010", "1011", "1042"), strict=True):
+            obj["info"]["props"]["object.serial"] = serial
+        oma_aux.reconcile_routes()
+        self.assertEqual([call.args[0][2] for call in self.run.call_args_list], ["42"])
+
+    def test_legacy_node_id_lifetime_migrates_without_reapply(self):
+        oma_aux.set_app_settings(self.key, {"mute": True})
+        state = oma_aux.load_state()
+        applied = state["apps"][self.key]["applied"]
+        expected = set(applied)
+        state["apps"][self.key]["applied"] = {
+            f"{lifetime}:{node_id}": value
+            for (lifetime, value), node_id in zip(applied.items(), (10, 11), strict=True)
+        }
+        oma_aux.save_state(state)
+        self.run.reset_mock()
+
+        oma_aux.reconcile_routes()
+
+        self.run.assert_not_called()
+        self.assertEqual(set(oma_aux.load_state()["apps"][self.key]["applied"]),
+                         expected)
 
     def test_reused_id_or_changed_server_is_a_new_lifetime(self):
         oma_aux.set_app_settings(self.key, {"volume": 0})
