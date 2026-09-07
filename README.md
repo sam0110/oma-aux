@@ -12,6 +12,12 @@ the center routing lane to insert a per-route stereo processor with balance and
 five-band equalization. Balance can place a source in the left or right ear;
 the EQ provides ±12 dB at 100 Hz, 250 Hz, 1 kHz, 4 kHz, and 10 kHz.
 
+## Preview
+
+![Oma Aux routing graph](preview1.png)
+
+![Oma Aux balance and equalizer controls](preview2.png)
+
 ## Requirements
 
 - Omarchy Shell
