@@ -18,10 +18,14 @@ Panel {
   property bool loading: false
   property string error: ""
   property string pendingConnection: ""
+  property string drawingSourceKey: ""
+  property real drawingX: 0
+  property real drawingY: 0
 
   readonly property var sources: graph.sources || []
   readonly property var destinations: graph.destinations || []
   readonly property var links: graph.links || []
+  readonly property int routeCount: countRoutes(links)
   readonly property var selectedSource: sourceByKey(selectedSourceKey)
   readonly property int selectedSourceId: selectedSource ? selectedSource.id : -1
 
@@ -42,6 +46,13 @@ Panel {
         found.push(link)
     }
     return found
+  }
+
+  function countRoutes(allLinks) {
+    var routes = ({})
+    for (var i = 0; i < allLinks.length; i++)
+      routes[allLinks[i].outputNode + ":" + allLinks[i].inputNode] = true
+    return Object.keys(routes).length
   }
 
   function connectionState(source, destination) {
@@ -91,17 +102,42 @@ Panel {
     }
   }
 
-  function toggleConnection(destinationId) {
-    if (selectedSourceId < 0 || actionProc.running) return
-    pendingConnection = selectedSourceId + ":" + destinationId
+  function toggleConnectionFor(sourceId, destinationId) {
+    if (sourceId < 0 || actionProc.running) return
+    pendingConnection = sourceId + ":" + destinationId
     error = ""
     actionProc.command = [
       pluginDir + "/bin/oma-aux",
       "toggle",
-      String(selectedSourceId),
+      String(sourceId),
       String(destinationId)
     ]
     actionProc.running = true
+  }
+
+  function toggleConnection(destinationId) {
+    toggleConnectionFor(selectedSourceId, destinationId)
+  }
+
+  function beginConnection(sourceKey, point) {
+    selectedSourceKey = sourceKey
+    drawingSourceKey = sourceKey
+    drawingX = point.x
+    drawingY = point.y
+  }
+
+  function updateConnection(point) {
+    drawingX = Math.max(0, Math.min(graphBoard.width, point.x))
+    drawingY = Math.max(0, Math.min(graphBoard.height, point.y))
+  }
+
+  function finishConnection(point) {
+    updateConnection(point)
+    var source = sourceByKey(drawingSourceKey)
+    var destination = graphBoard.destinationAt(point.x, point.y)
+    drawingSourceKey = ""
+    if (source && destination)
+      toggleConnectionFor(source.id, destination.id)
   }
 
   onOpenedChanged: {
@@ -110,6 +146,7 @@ Panel {
       error = ""
     } else {
       pendingConnection = ""
+      drawingSourceKey = ""
     }
   }
 
@@ -161,7 +198,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(680))
+    contentWidth: panel.fittedContentWidth(Style.space(940))
     contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
@@ -209,7 +246,7 @@ Panel {
             Text {
               text: root.loading
                 ? "Reading the PipeWire graph…"
-                : root.sources.length + " sources  ·  " + root.destinations.length + " destinations  ·  " + root.links.length + " links"
+                : root.sources.length + " sources  ·  " + root.destinations.length + " destinations  ·  " + root.routeCount + " routes"
               color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.62)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -246,192 +283,331 @@ Panel {
           horizontalAlignment: Text.AlignHCenter
         }
 
-        Row {
-          id: routingColumns
+        Column {
           visible: root.sources.length > 0
           width: parent.width
-          spacing: Style.space(14)
+          spacing: Style.space(8)
 
-          Column {
-            id: sourcePane
-            width: (parent.width - parent.spacing) * 0.44
-            spacing: Style.space(8)
+          Row {
+            width: parent.width
 
             PanelSectionHeader {
-              text: "FROM"
+              width: graphBoard.nodeWidth
+              text: "SOURCES"
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
             }
 
-            ScrollView {
-              width: parent.width
-              height: Math.min(sourceColumn.implicitHeight, Style.space(470))
-              clip: true
-              ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-              ScrollBar.vertical.policy: sourceColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+            PanelSectionHeader {
+              width: parent.width - graphBoard.nodeWidth * 2
+              text: "ROUTES / FILTERS"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalAlignment: Text.AlignHCenter
+            }
 
-              Column {
-                id: sourceColumn
-                width: parent.width
-                spacing: Style.space(5)
+            PanelSectionHeader {
+              width: graphBoard.nodeWidth
+              text: "DESTINATIONS"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalAlignment: Text.AlignRight
+            }
+          }
 
-                Repeater {
-                  model: root.sources
+          Item {
+            id: graphBoard
+            width: parent.width
+            implicitHeight: Math.max(root.sources.length, root.destinations.length) * rowPitch
+            height: implicitHeight
 
-                  delegate: CursorSurface {
-                    required property var modelData
-                    width: sourceColumn.width
-                    implicitHeight: sourceBody.implicitHeight + Style.space(16)
-                    current: root.selectedSourceKey === modelData.key
-                    foreground: root.bar.foreground
-                    fill: current
-                      ? Style.selectedFillFor(root.bar.foreground, Color.accent)
-                      : Style.hoverFillFor(root.bar.foreground, Color.accent)
+            readonly property real nodeWidth: Math.min(Style.space(250), width * 0.32)
+            readonly property real nodeHeight: Style.space(64)
+            readonly property real rowPitch: Style.space(76)
+            readonly property real socketRadius: Style.space(6)
 
-                    MouseArea {
-                      anchors.fill: parent
-                      onClicked: root.selectedSourceKey = modelData.key
+            function destinationAt(x, y) {
+              if (x < width - nodeWidth - Style.space(24)) return null
+              var index = Math.floor(y / rowPitch)
+              if (index < 0 || index >= root.destinations.length) return null
+              if (y - index * rowPitch > nodeHeight) return null
+              return root.destinations[index]
+            }
+
+            Rectangle {
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.horizontalCenter: parent.horizontalCenter
+              width: Math.max(Style.space(96), graphBoard.width - graphBoard.nodeWidth * 2 - Style.space(72))
+              radius: Style.cornerRadius
+              color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.035)
+              border.width: 1
+              border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.10)
+
+              Text {
+                anchors.top: parent.top
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.topMargin: Style.space(8)
+                text: "FILTER SLOTS"
+                color: root.bar.foreground
+                opacity: 0.26
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 1.2
+              }
+            }
+
+            Canvas {
+              id: routeCanvas
+              anchors.fill: parent
+              property var graphData: root.graph
+              property string highlightedSource: root.selectedSourceKey
+              property string drawingSource: root.drawingSourceKey
+              property real pointerX: root.drawingX
+              property real pointerY: root.drawingY
+
+              onGraphDataChanged: requestPaint()
+              onHighlightedSourceChanged: requestPaint()
+              onDrawingSourceChanged: requestPaint()
+              onPointerXChanged: requestPaint()
+              onPointerYChanged: requestPaint()
+              onWidthChanged: requestPaint()
+              onHeightChanged: requestPaint()
+
+              onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                ctx.lineCap = "round"
+
+                for (var sourceIndex = 0; sourceIndex < root.sources.length; sourceIndex++) {
+                  var source = root.sources[sourceIndex]
+                  for (var destinationIndex = 0; destinationIndex < root.destinations.length; destinationIndex++) {
+                    var destination = root.destinations[destinationIndex]
+                    var state = root.connectionState(source, destination)
+                    if (state === "disconnected") continue
+
+                    var x1 = graphBoard.nodeWidth
+                    var y1 = sourceIndex * graphBoard.rowPitch + graphBoard.nodeHeight / 2
+                    var x2 = graphBoard.width - graphBoard.nodeWidth
+                    var y2 = destinationIndex * graphBoard.rowPitch + graphBoard.nodeHeight / 2
+                    var span = x2 - x1
+                    ctx.beginPath()
+                    ctx.moveTo(x1, y1)
+                    ctx.bezierCurveTo(x1 + span * 0.42, y1, x2 - span * 0.42, y2, x2, y2)
+                    ctx.strokeStyle = source.key === root.selectedSourceKey
+                      ? Color.accent
+                      : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.42)
+                    ctx.lineWidth = state === "partial" ? 2 : 3
+                    ctx.stroke()
+
+                    var middleX = (x1 + x2) / 2
+                    var middleY = (y1 + y2) / 2
+                    ctx.beginPath()
+                    ctx.arc(middleX, middleY, Style.space(4), 0, Math.PI * 2)
+                    ctx.fillStyle = state === "partial"
+                      ? Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.65)
+                      : Color.accent
+                    ctx.fill()
+                  }
+                }
+
+                if (root.drawingSourceKey !== "") {
+                  var drawingIndex = -1
+                  for (var i = 0; i < root.sources.length; i++)
+                    if (root.sources[i].key === root.drawingSourceKey) drawingIndex = i
+                  if (drawingIndex >= 0) {
+                    var startX = graphBoard.nodeWidth
+                    var startY = drawingIndex * graphBoard.rowPitch + graphBoard.nodeHeight / 2
+                    var control = Math.max(Style.space(40), (root.drawingX - startX) * 0.45)
+                    ctx.beginPath()
+                    ctx.moveTo(startX, startY)
+                    ctx.bezierCurveTo(startX + control, startY, root.drawingX - control, root.drawingY, root.drawingX, root.drawingY)
+                    ctx.strokeStyle = Color.accent
+                    ctx.lineWidth = 3
+                    ctx.stroke()
+                  }
+                }
+              }
+            }
+
+            Repeater {
+              model: root.sources
+
+              delegate: CursorSurface {
+                required property var modelData
+                required property int index
+                x: 0
+                y: index * graphBoard.rowPitch
+                width: graphBoard.nodeWidth
+                height: graphBoard.nodeHeight
+                current: root.selectedSourceKey === modelData.key
+                foreground: root.bar.foreground
+                fill: current
+                  ? Style.selectedFillFor(root.bar.foreground, Color.accent)
+                  : Style.hoverFillFor(root.bar.foreground, Color.accent)
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: root.selectedSourceKey = modelData.key
+                }
+
+                Column {
+                  anchors.left: parent.left
+                  anchors.right: sourceSocket.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(2)
+
+                  Text {
+                    width: parent.width
+                    text: modelData.label
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: root.selectedSourceKey === modelData.key
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: root.kindLabel(modelData.kind) + "  ·  " + root.portSummary(modelData)
+                    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.55)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                Rectangle {
+                  id: sourceSocket
+                  z: 2
+                  anchors.right: parent.right
+                  anchors.rightMargin: -graphBoard.socketRadius
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: graphBoard.socketRadius * 2
+                  height: width
+                  radius: width / 2
+                  color: root.selectedSourceKey === modelData.key ? Color.accent : root.bar.foreground
+                  border.width: 2
+                  border.color: root.bar.background
+
+                  MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(10)
+                    cursorShape: Qt.CrossCursor
+                    enabled: !actionProc.running
+                    onPressed: function(mouse) {
+                      var point = mapToItem(graphBoard, mouse.x, mouse.y)
+                      root.beginConnection(modelData.key, point)
+                    }
+                    onPositionChanged: function(mouse) {
+                      if (pressed) root.updateConnection(mapToItem(graphBoard, mouse.x, mouse.y))
+                    }
+                    onReleased: function(mouse) {
+                      root.finishConnection(mapToItem(graphBoard, mouse.x, mouse.y))
+                    }
+                    onCanceled: root.drawingSourceKey = ""
+                  }
+                }
+              }
+            }
+
+            Repeater {
+              model: root.destinations
+
+              delegate: CursorSurface {
+                required property var modelData
+                required property int index
+                readonly property string routeState: root.connectionState(root.selectedSource, modelData)
+                readonly property bool connected: routeState === "connected"
+                readonly property bool partial: routeState === "partial"
+                readonly property bool pending: root.pendingConnection
+                  === root.selectedSourceId + ":" + modelData.id
+                x: graphBoard.width - width
+                y: index * graphBoard.rowPitch
+                width: graphBoard.nodeWidth
+                height: graphBoard.nodeHeight
+                current: connected || partial
+                foreground: root.bar.foreground
+                fill: current
+                  ? Style.selectedFillFor(root.bar.foreground, Color.accent)
+                  : Style.hoverFillFor(root.bar.foreground, Color.accent)
+
+                MouseArea {
+                  anchors.fill: parent
+                  enabled: root.selectedSourceId >= 0 && !actionProc.running
+                  onClicked: root.toggleConnection(modelData.id)
+                }
+
+                Rectangle {
+                  anchors.left: parent.left
+                  anchors.leftMargin: -graphBoard.socketRadius
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: graphBoard.socketRadius * 2
+                  height: width
+                  radius: width / 2
+                  color: connected || partial ? Color.accent : root.bar.foreground
+                  opacity: connected || partial ? 1 : 0.55
+                  border.width: 2
+                  border.color: root.bar.background
+                }
+
+                Row {
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(14)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(8)
+
+                  Column {
+                    width: parent.width - destinationMark.width - parent.spacing
+                    spacing: Style.space(2)
+
+                    Text {
+                      width: parent.width
+                      text: modelData.label
+                      color: root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: connected
+                      elide: Text.ElideRight
                     }
 
-                    Column {
-                      id: sourceBody
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      anchors.leftMargin: Style.space(10)
-                      anchors.rightMargin: Style.space(10)
-                      spacing: Style.space(2)
-
-                      Text {
-                        width: parent.width
-                        text: modelData.label
-                        color: root.bar.foreground
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.body
-                        font.bold: root.selectedSourceKey === modelData.key
-                        elide: Text.ElideRight
-                      }
-
-                      Text {
-                        width: parent.width
-                        text: root.kindLabel(modelData.kind) + "  ·  " + root.portSummary(modelData)
-                        color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.55)
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.caption
-                        elide: Text.ElideRight
-                      }
+                    Text {
+                      width: parent.width
+                      text: root.kindLabel(modelData.kind) + "  ·  " + root.portSummary(modelData)
+                      color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.55)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
                     }
+                  }
+
+                  Text {
+                    id: destinationMark
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: pending ? "󰔟" : (connected ? "󰌷" : (partial ? "~" : ""))
+                    color: connected || partial ? Color.accent : root.bar.foreground
+                    opacity: connected ? 1 : 0.75
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.title
                   }
                 }
               }
             }
           }
 
-          Column {
-            width: routingColumns.width - routingColumns.spacing - sourcePane.width
-            spacing: Style.space(8)
-
-            PanelSectionHeader {
-              text: root.selectedSource ? "TO · " + root.selectedSource.label : "TO"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-            }
-
-            ScrollView {
-              width: parent.width
-              height: Math.min(destinationColumn.implicitHeight, Style.space(470))
-              clip: true
-              ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-              ScrollBar.vertical.policy: destinationColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
-
-              Column {
-                id: destinationColumn
-                width: parent.width
-                spacing: Style.space(5)
-
-                Repeater {
-                  model: root.destinations
-
-                  delegate: CursorSurface {
-                    required property var modelData
-                    readonly property string routeState: root.connectionState(root.selectedSource, modelData)
-                    readonly property bool connected: routeState === "connected"
-                    readonly property bool partial: routeState === "partial"
-                    readonly property bool pending: root.pendingConnection
-                      === root.selectedSourceId + ":" + modelData.id
-                    width: destinationColumn.width
-                    implicitHeight: destinationBody.implicitHeight + Style.space(16)
-                    current: connected || partial
-                    foreground: root.bar.foreground
-                    fill: connected
-                      ? Style.selectedFillFor(root.bar.foreground, Color.accent)
-                      : Style.hoverFillFor(root.bar.foreground, Color.accent)
-
-                    MouseArea {
-                      anchors.fill: parent
-                      enabled: root.selectedSourceId >= 0 && !actionProc.running
-                      onClicked: root.toggleConnection(modelData.id)
-                    }
-
-                    Row {
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      anchors.leftMargin: Style.space(10)
-                      anchors.rightMargin: Style.space(10)
-                      spacing: Style.space(8)
-
-                      Column {
-                        id: destinationBody
-                        width: parent.width - connectionMark.width - parent.spacing
-                        spacing: Style.space(2)
-
-                        Text {
-                          width: parent.width
-                          text: modelData.label
-                          color: root.bar.foreground
-                          font.family: root.bar.fontFamily
-                          font.pixelSize: Style.font.body
-                          font.bold: connected
-                          elide: Text.ElideRight
-                        }
-
-                        Text {
-                          width: parent.width
-                          text: root.kindLabel(modelData.kind) + "  ·  " + root.portSummary(modelData)
-                          color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.55)
-                          font.family: root.bar.fontFamily
-                          font.pixelSize: Style.font.caption
-                          elide: Text.ElideRight
-                        }
-                      }
-
-                      Text {
-                        id: connectionMark
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: pending ? "󰔟" : (connected ? "󰌷" : (partial ? "~" : "󰌹"))
-                        color: connected || partial ? Color.accent : root.bar.foreground
-                        opacity: connected ? 1 : (partial ? 0.75 : 0.45)
-                        font.family: root.bar.fontFamily
-                        font.pixelSize: Style.font.title
-                      }
-                    }
-                  }
-                }
-              }
-            }
+          Text {
+            width: parent.width
+            text: "Drag from a source socket to a destination, or select a source and click destinations. One source can feed many destinations."
+            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.48)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
           }
-        }
-
-        Text {
-          visible: root.sources.length > 0
-          width: parent.width
-          text: "Select a source, then click a destination to connect or disconnect all matching channels."
-          color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.48)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          horizontalAlignment: Text.AlignHCenter
-          wrapMode: Text.WordWrap
         }
         }
       }
