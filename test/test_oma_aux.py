@@ -39,6 +39,36 @@ class ChannelPairTests(unittest.TestCase):
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_gives_duplicate_application_streams_distinct_keys_and_labels(self):
+        objects = []
+        for node_id, serial in ((10, "1000"), (11, "1001")):
+            objects.extend([
+                {
+                    "id": node_id,
+                    "type": "PipeWire:Interface:Node",
+                    "info": {"props": {
+                        "node.name": "Firefox",
+                        "application.name": "Firefox",
+                        "media.class": "Stream/Output/Audio",
+                        "object.serial": serial,
+                    }},
+                },
+                {
+                    "id": node_id + 10,
+                    "type": "PipeWire:Interface:Port",
+                    "info": {"props": {
+                        "node.id": node_id,
+                        "port.direction": "out",
+                        "audio.channel": "FL",
+                    }},
+                },
+            ])
+
+        sources = oma_aux.normalize_graph(objects)["sources"]
+
+        self.assertEqual([source["key"] for source in sources], ["1000:out", "1001:out"])
+        self.assertEqual([source["label"] for source in sources], ["Firefox 1", "Firefox 2"])
+
     def test_exposes_sink_input_and_monitor_as_separate_endpoints(self):
         objects = [
             {
@@ -78,8 +108,10 @@ class NormalizeTests(unittest.TestCase):
 
         self.assertEqual(graph["sources"][0]["label"], "Speakers monitor")
         self.assertEqual(graph["sources"][0]["kind"], "monitor")
+        self.assertEqual(graph["sources"][0]["key"], "speakers:out")
         self.assertEqual(graph["destinations"][0]["label"], "Speakers")
         self.assertEqual(graph["destinations"][0]["kind"], "device")
+        self.assertEqual(graph["destinations"][0]["key"], "speakers:in")
 
     def test_hides_owned_filter_nodes(self):
         objects = [
@@ -172,8 +204,10 @@ class FilterTests(unittest.TestCase):
             "pid": 123,
         }
         graph = {
-            "sources": [{"id": 1, "name": "spotify"}],
-            "destinations": [{"id": 2, "name": "headphones"}],
+            "sources": [{"id": 1, "key": "spotify:out", "name": "spotify"}],
+            "destinations": [{
+                "id": 2, "key": "headphones:in", "name": "headphones"
+            }],
             "links": [],
         }
         state = {"routes": [route]}
@@ -207,8 +241,10 @@ class FilterTests(unittest.TestCase):
             "pid": 123,
         }
         graph = {
-            "sources": [{"id": 1, "name": "spotify"}],
-            "destinations": [{"id": 2, "name": "headphones"}],
+            "sources": [{"id": 1, "key": "spotify:out", "name": "spotify"}],
+            "destinations": [{
+                "id": 2, "key": "headphones:in", "name": "headphones"
+            }],
             "links": [],
         }
         state = {"routes": [route]}
@@ -255,6 +291,73 @@ class FilterTests(unittest.TestCase):
         ):
             snapshot = oma_aux.graph_snapshot()
         self.assertFalse(snapshot["routes"][0]["filtered"])
+
+    def test_saved_routes_match_duplicate_streams_by_key(self):
+        first = {"id": 1, "key": "1000:out", "name": "Firefox"}
+        second = {"id": 2, "key": "1001:out", "name": "Firefox"}
+        destination = {"id": 3, "key": "2000:in", "name": "headphones"}
+        graph = {
+            "sources": [first, second],
+            "destinations": [destination],
+            "links": [],
+        }
+        route = {
+            "sourceName": "Firefox",
+            "sourceKey": "1001:out",
+            "destinationName": "headphones",
+            "destinationKey": "2000:in",
+        }
+
+        matched = oma_aux.saved_route_for_endpoints(
+            {"routes": [route]}, graph, second, destination
+        )
+
+        self.assertIs(matched, route)
+        self.assertIsNone(oma_aux.saved_route_for_endpoints(
+            {"routes": [route]}, graph, first, destination
+        ))
+
+    def test_legacy_route_does_not_guess_between_duplicate_streams(self):
+        graph = {
+            "sources": [
+                {"key": "1000:out", "name": "Firefox"},
+                {"key": "1001:out", "name": "Firefox"},
+            ],
+            "destinations": [],
+        }
+        route = {"sourceName": "Firefox"}
+
+        self.assertIsNone(oma_aux.saved_endpoint(graph, "sources", route, "source"))
+        self.assertNotIn("sourceKey", route)
+
+    def test_direct_routes_for_duplicate_streams_have_distinct_ids(self):
+        graph = {
+            "sources": [
+                {"id": 1, "key": "1000:out", "name": "Firefox", "ports": [
+                    {"id": 11, "channel": "FL"}
+                ]},
+                {"id": 2, "key": "1001:out", "name": "Firefox", "ports": [
+                    {"id": 12, "channel": "FL"}
+                ]},
+            ],
+            "destinations": [{
+                "id": 3,
+                "key": "2000:in",
+                "name": "headphones",
+                "ports": [{"id": 13, "channel": "FL"}],
+            }],
+            "links": [
+                {"id": 20, "outputNode": 1, "outputPort": 11,
+                 "inputNode": 3, "inputPort": 13},
+                {"id": 21, "outputNode": 2, "outputPort": 12,
+                 "inputNode": 3, "inputPort": 13},
+            ],
+        }
+
+        routes = oma_aux.direct_routes(graph)
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(len({route["id"] for route in routes}), 2)
 
 
 class ToggleTests(unittest.TestCase):

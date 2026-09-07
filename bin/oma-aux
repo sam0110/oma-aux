@@ -70,6 +70,15 @@ def node_label(props: dict) -> str:
     )
 
 
+def endpoint_key(node_id: int, props: dict, direction: str) -> str:
+    media_class = str(props.get("media.class") or "")
+    if media_class.startswith("Stream/"):
+        identity = props.get("object.serial") or node_id
+    else:
+        identity = props.get("node.name") or props.get("object.serial") or node_id
+    return f"{identity}:{direction}"
+
+
 def endpoint_kind(media_class: str, direction: str) -> str:
     if direction == "out":
         if media_class == "Audio/Sink":
@@ -162,7 +171,7 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
             target.append(
                 {
                     "id": node_id,
-                    "key": f"{name}:{direction}",
+                    "key": endpoint_key(node_id, props, direction),
                     "name": name,
                     "label": label,
                     "kind": kind,
@@ -178,6 +187,14 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
     )
     sources.sort(key=sort_key)
     destinations.sort(key=sort_key)
+    for endpoints in (sources, destinations):
+        by_label: dict[str, list[dict]] = defaultdict(list)
+        for endpoint in endpoints:
+            by_label[endpoint["label"]].append(endpoint)
+        for duplicates in by_label.values():
+            if len(duplicates) > 1:
+                for index, endpoint in enumerate(duplicates, 1):
+                    endpoint["label"] = f"{endpoint['label']} {index}"
 
     links = []
     for obj in raw_links:
@@ -209,8 +226,8 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
     return {"sources": sources, "destinations": destinations, "links": links}
 
 
-def route_id(source_name: str, destination_name: str) -> str:
-    value = f"{source_name}\0{destination_name}".encode()
+def route_id(source_key: str, destination_key: str) -> str:
+    value = f"{source_key}\0{destination_key}".encode()
     return hashlib.sha256(value).hexdigest()[:16]
 
 
@@ -274,6 +291,38 @@ def save_state(state: dict) -> None:
 
 def endpoint_by_name(graph: dict, collection: str, name: str) -> dict | None:
     return next((item for item in graph.get(collection, []) if item["name"] == name), None)
+
+
+def saved_endpoint(graph: dict, collection: str, route: dict, prefix: str) -> dict | None:
+    key = route.get(f"{prefix}Key")
+    if key:
+        return next(
+            (item for item in graph.get(collection, []) if item["key"] == key), None
+        )
+    name = route.get(f"{prefix}Name")
+    matches = [item for item in graph.get(collection, []) if item["name"] == name]
+    if len(matches) == 1:
+        route[f"{prefix}Key"] = matches[0]["key"]
+        return matches[0]
+    return None
+
+
+def saved_route_for_endpoints(
+    state: dict, graph: dict, source: dict, destination: dict
+) -> dict | None:
+    for route in state["routes"]:
+        saved_source = saved_endpoint(graph, "sources", route, "source")
+        saved_destination = saved_endpoint(
+            graph, "destinations", route, "destination"
+        )
+        if (
+            saved_source
+            and saved_destination
+            and saved_source["key"] == source["key"]
+            and saved_destination["key"] == destination["key"]
+        ):
+            return route
+    return None
 
 
 def process_start_time(pid: int) -> str:
@@ -465,8 +514,8 @@ def disconnect_endpoint_pair(graph: dict, source_id: int, destination_id: int) -
 
 def activate_route(route: dict) -> None:
     public_graph = normalize_graph(pipewire_dump())
-    source = endpoint_by_name(public_graph, "sources", route["sourceName"])
-    destination = endpoint_by_name(public_graph, "destinations", route["destinationName"])
+    source = saved_endpoint(public_graph, "sources", route, "source")
+    destination = saved_endpoint(public_graph, "destinations", route, "destination")
     if not source or not destination:
         route["status"] = "waiting"
         return
@@ -510,7 +559,7 @@ def direct_routes(graph: dict) -> list[dict]:
         existing = {(link["outputPort"], link["inputPort"]) for link in links}
         routes.append(
             {
-                "id": route_id(source["name"], destination["name"]),
+                "id": route_id(source["key"], destination["key"]),
                 "sourceId": source_id,
                 "sourceKey": source["key"],
                 "destinationId": destination_id,
@@ -528,8 +577,8 @@ def graph_snapshot() -> dict:
     graph = normalize_graph(pipewire_dump())
     routes_by_id = {route["id"]: route for route in direct_routes(graph)}
     for saved in state["routes"]:
-        source = endpoint_by_name(graph, "sources", saved["sourceName"])
-        destination = endpoint_by_name(graph, "destinations", saved["destinationName"])
+        source = saved_endpoint(graph, "sources", saved, "source")
+        destination = saved_endpoint(graph, "destinations", saved, "destination")
         if not source or not destination:
             continue
         routes_by_id[saved["id"]] = {
@@ -634,15 +683,7 @@ def toggle_nodes(output_node: int, input_node: int) -> None:
     destination = endpoint(graph, "destinations", input_node)
     with state_lock():
         state = load_state()
-        saved = next(
-            (
-                route
-                for route in state["routes"]
-                if route["sourceName"] == source["name"]
-                and route["destinationName"] == destination["name"]
-            ),
-            None,
-        )
+        saved = saved_route_for_endpoints(state, graph, source, destination)
         if saved:
             stop_route_process(saved)
             state["routes"].remove(saved)
@@ -669,12 +710,10 @@ def set_route_filter(output_node: int, input_node: int, value: object) -> None:
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
-    identifier = route_id(source["name"], destination["name"])
+    identifier = route_id(source["key"], destination["key"])
     with state_lock():
         state = load_state()
-        old_route = next(
-            (route for route in state["routes"] if route["id"] == identifier), None
-        )
+        old_route = saved_route_for_endpoints(state, graph, source, destination)
         if old_route and route_process_alive(old_route):
             set_filter_controls(old_route, settings)
             old_route["filter"] = settings
@@ -684,7 +723,9 @@ def set_route_filter(output_node: int, input_node: int, value: object) -> None:
         route = {
             "id": identifier,
             "sourceName": source["name"],
+            "sourceKey": source["key"],
             "destinationName": destination["name"],
+            "destinationKey": destination["key"],
             "filter": settings,
             "enabled": True,
             "status": "starting",
@@ -706,10 +747,9 @@ def clear_route_filter(output_node: int, input_node: int) -> None:
     graph = normalize_graph(pipewire_dump())
     source = endpoint(graph, "sources", output_node)
     destination = endpoint(graph, "destinations", input_node)
-    identifier = route_id(source["name"], destination["name"])
     with state_lock():
         state = load_state()
-        route = next((item for item in state["routes"] if item["id"] == identifier), None)
+        route = saved_route_for_endpoints(state, graph, source, destination)
         if not route:
             return
         if not route_process_alive(route):
