@@ -73,7 +73,7 @@ def node_label(props: dict) -> str:
 def endpoint_key(node_id: int, props: dict, direction: str) -> str:
     media_class = str(props.get("media.class") or "")
     if media_class.startswith("Stream/"):
-        identity = props.get("object.serial") or node_id
+        identity = node_id
     else:
         identity = props.get("node.name") or props.get("object.serial") or node_id
     return f"{identity}:{direction}"
@@ -172,6 +172,7 @@ def normalize_graph(objects: list[dict], include_managed: bool = False) -> dict:
                 {
                     "id": node_id,
                     "key": endpoint_key(node_id, props, direction),
+                    "serial": str(props.get("object.serial") or ""),
                     "name": name,
                     "label": label,
                     "kind": kind,
@@ -295,11 +296,31 @@ def endpoint_by_name(graph: dict, collection: str, name: str) -> dict | None:
 
 def saved_endpoint(graph: dict, collection: str, route: dict, prefix: str) -> dict | None:
     key = route.get(f"{prefix}Key")
-    if key:
-        return next(
-            (item for item in graph.get(collection, []) if item["key"] == key), None
-        )
     name = route.get(f"{prefix}Name")
+    if key:
+        matches = [
+            item
+            for item in graph.get(collection, [])
+            if item["key"] == key and item["name"] == name
+        ]
+        if matches:
+            return matches[0]
+
+        # Version 1 briefly stored PipeWire object serials for streams. Firefox
+        # replaces those serials when paused media resumes, while retaining the
+        # node id used by the graph.
+        direction = "out" if collection == "sources" else "in"
+        matches = [
+            item
+            for item in graph.get(collection, [])
+            if item.get("serial")
+            and f"{item['serial']}:{direction}" == key
+            and item["name"] == name
+        ]
+        if matches:
+            route[f"{prefix}Key"] = matches[0]["key"]
+            return matches[0]
+        return None
     matches = [item for item in graph.get(collection, []) if item["name"] == name]
     if len(matches) == 1:
         route[f"{prefix}Key"] = matches[0]["key"]

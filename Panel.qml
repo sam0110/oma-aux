@@ -96,7 +96,6 @@ Panel {
   }
 
   function applySnapshot(line) {
-    if (!opened) return
     try {
       var parsed = JSON.parse(String(line || ""))
       if (!parsed.sources || !parsed.destinations || !parsed.links || !parsed.routes) return
@@ -213,7 +212,8 @@ Panel {
   Process {
     id: graphWatcher
     command: [root.pluginDir + "/bin/oma-aux", "watch"]
-    running: root.opened
+    // Reconcile audio routes even while the panel is closed.
+    running: true
     stdout: SplitParser { onRead: function(line) { root.applySnapshot(line) } }
     stderr: StdioCollector {
       waitForEnd: true

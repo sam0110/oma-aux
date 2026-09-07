@@ -66,7 +66,7 @@ class NormalizeTests(unittest.TestCase):
 
         sources = oma_aux.normalize_graph(objects)["sources"]
 
-        self.assertEqual([source["key"] for source in sources], ["1000:out", "1001:out"])
+        self.assertEqual([source["key"] for source in sources], ["10:out", "11:out"])
         self.assertEqual([source["label"] for source in sources], ["Firefox 1", "Firefox 2"])
 
     def test_exposes_sink_input_and_monitor_as_separate_endpoints(self):
@@ -293,8 +293,8 @@ class FilterTests(unittest.TestCase):
         self.assertFalse(snapshot["routes"][0]["filtered"])
 
     def test_saved_routes_match_duplicate_streams_by_key(self):
-        first = {"id": 1, "key": "1000:out", "name": "Firefox"}
-        second = {"id": 2, "key": "1001:out", "name": "Firefox"}
+        first = {"id": 1, "key": "1:out", "serial": "1000", "name": "Firefox"}
+        second = {"id": 2, "key": "2:out", "serial": "1001", "name": "Firefox"}
         destination = {"id": 3, "key": "2000:in", "name": "headphones"}
         graph = {
             "sources": [first, second],
@@ -303,7 +303,7 @@ class FilterTests(unittest.TestCase):
         }
         route = {
             "sourceName": "Firefox",
-            "sourceKey": "1001:out",
+            "sourceKey": "2:out",
             "destinationName": "headphones",
             "destinationKey": "2000:in",
         }
@@ -316,6 +316,21 @@ class FilterTests(unittest.TestCase):
         self.assertIsNone(oma_aux.saved_route_for_endpoints(
             {"routes": [route]}, graph, first, destination
         ))
+
+    def test_migrates_serial_key_to_stable_stream_node_key(self):
+        source = {
+            "id": 78,
+            "key": "78:out",
+            "serial": "59398",
+            "name": "Firefox",
+        }
+        route = {"sourceName": "Firefox", "sourceKey": "59398:out"}
+        graph = {"sources": [source]}
+
+        matched = oma_aux.saved_endpoint(graph, "sources", route, "source")
+
+        self.assertIs(matched, source)
+        self.assertEqual(route["sourceKey"], "78:out")
 
     def test_legacy_route_does_not_guess_between_duplicate_streams(self):
         graph = {
